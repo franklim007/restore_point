@@ -1,0 +1,612 @@
+---
+# ================================================================
+# PLAYBOOK: oracle_restore_points.yml
+# Consulta si existen restore points activos en bases de datos
+# Oracle 19c Single Instance y muestra un resumen consolidado.
+#
+# Uso:
+#   ansible-playbook -i inventory/hosts.ini oracle_restore_points.yml
+#
+# Parámetros opcionales:
+#   -e "target_host=oradb01"   (limitar a un host concreto, default all)
+#   -e "alert_days=7"          (avisar si el RP tiene más de N días, default 7)
+# ================================================================
+
+- name: "Oracle - Consulta de Restore Points Activos"
+  hosts: "{{ target_host | default('oracle_single_instance') }}"
+  gather_facts: true
+  serial: 5
+  vars:
+    oracle_user:   "/ as sysdba"
+    alert_days:    "{{ alert_days | default(7) }}"
+    report_dir:    "/tmp/oracle_rp_check"
+    log_file:      "restore_points_{{ ansible_date_time.date }}.log"
+    local_out_dir: "/var/ansible/oracle_reports/restore_points"
+
+  # ------------------------------------------------------------
+  pre_tasks:
+
+    - name: "PRE | Crear directorio temporal en servidor"
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_os_user | default('oracle') }}"
+        mode: '0750'
+
+    - name: "PRE | Crear directorio local en controller"
+      ansible.builtin.file:
+        path: "{{ local_out_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+  # ------------------------------------------------------------
+  tasks:
+
+    # ===========================================================
+    # BLOQUE 1 — VERIFICAR INSTANCIA
+    # ===========================================================
+    - name: "1 | Verificar que la instancia está abierta"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        SELECT status FROM v$instance;
+        EXIT;
+        EOF
+      register: r_instance_status
+      changed_when: false
+      failed_when: false
+
+    - name: "1 | Marcar instancia como no disponible"
+      ansible.builtin.set_fact:
+        instance_available: false
+      when: >
+        r_instance_status.rc != 0 or
+        'OPEN' not in r_instance_status.stdout
+
+    - name: "1 | Marcar instancia como disponible"
+      ansible.builtin.set_fact:
+        instance_available: true
+      when: >
+        r_instance_status.rc == 0 and
+        'OPEN' in r_instance_status.stdout
+
+    # ===========================================================
+    # BLOQUE 2 — CONSULTAR RESTORE POINTS
+    # ===========================================================
+    - name: "2 | Consultar restore points en v$restore_point"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            rp.name                                              || '|' ||
+            rp.guarantee_flashback_database                      || '|' ||
+            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')            || '|' ||
+            ROUND((SYSDATE - rp.time), 2)                        || '|' ||
+            NVL(rp.storage_size, 0)                              || '|' ||
+            rp.scn                                               || '|' ||
+            NVL(rp.pdb_restore_point,'NO')                       || '|' ||
+            NVL(rp.clean_pdb_restore_point,'NO')                 || '|' ||
+            NVL(rp.pdb_incarnation#,0)
+        FROM v$restore_point rp
+        ORDER BY rp.time DESC;
+        EXIT;
+        EOF
+      register: r_restore_points
+      changed_when: false
+      when: instance_available | bool
+
+    - name: "2 | Consultar info general de la BD"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            d.name            || '|' ||
+            d.db_unique_name  || '|' ||
+            d.open_mode       || '|' ||
+            d.log_mode        || '|' ||
+            i.host_name       || '|' ||
+            i.version_full    || '|' ||
+            TO_CHAR(SYSDATE,'DD/MM/YYYY HH24:MI:SS')
+        FROM v$database d, v$instance i;
+        EXIT;
+        EOF
+      register: r_db_info
+      changed_when: false
+      when: instance_available | bool
+
+    - name: "2 | Consultar espacio de flashback usado"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
+        SELECT
+            NVL(flashback_on,'NO')                                    || '|' ||
+            NVL(TO_CHAR(oldest_flashback_time,'DD/MM/YYYY HH24:MI'),'N/A') || '|' ||
+            NVL(TO_CHAR(oldest_flashback_scn),'N/A')
+        FROM v$database;
+        EXIT;
+        EOF
+      register: r_flashback_info
+      changed_when: false
+      when: instance_available | bool
+
+    # ===========================================================
+    # BLOQUE 3 — PARSEAR Y GUARDAR FACTS
+    # ===========================================================
+    - name: "3 | Parsear restore points encontrados"
+      ansible.builtin.set_fact:
+        rp_lines: >-
+          {{ r_restore_points.stdout_lines
+             | default([])
+             | select('match', '.+\|.+')
+             | map('trim') | list }}
+      when: instance_available | bool
+
+    - name: "3 | Parsear info de BD"
+      ansible.builtin.set_fact:
+        db_info_parts: "{{ (r_db_info.stdout | trim).split('|') }}"
+      when:
+        - instance_available | bool
+        - r_db_info.stdout is defined
+        - r_db_info.stdout | trim | length > 0
+
+    - name: "3 | Parsear info de flashback"
+      ansible.builtin.set_fact:
+        fb_parts: "{{ (r_flashback_info.stdout | trim).split('|') }}"
+      when:
+        - instance_available | bool
+        - r_flashback_info.stdout is defined
+        - r_flashback_info.stdout | trim | length > 0
+
+    # ===========================================================
+    # BLOQUE 4 — MOSTRAR RESULTADO POR HOST EN CONSOLA
+    # ===========================================================
+    - name: "4 | Mostrar resultado — instancia NO disponible"
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " HOST      : {{ inventory_hostname }}"
+          - " SID       : {{ oracle_sid }}"
+          - " ESTADO    : *** INSTANCIA NO DISPONIBLE / NO OPEN ***"
+          - "============================================================"
+      when: not instance_available | bool
+
+    - name: "4 | Mostrar resultado — SIN restore points"
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " HOST      : {{ inventory_hostname }}"
+          - " BD        : {{ db_info_parts[0] | default(oracle_sid) }}"
+          - " UNIQUE    : {{ db_info_parts[1] | default('N/A') }}"
+          - " OPEN MODE : {{ db_info_parts[2] | default('N/A') }}"
+          - " LOG MODE  : {{ db_info_parts[3] | default('N/A') }}"
+          - " FLASHBACK : {{ fb_parts[0] | default('N/A') }}"
+          - "------------------------------------------------------------"
+          - " RESULTADO : Sin restore points activos"
+          - "============================================================"
+      when:
+        - instance_available | bool
+        - rp_lines | default([]) | length == 0
+
+    - name: "4 | Mostrar resultado — CON restore points"
+      ansible.builtin.debug:
+        msg: >-
+          {%- set msgs = [] -%}
+          {%- set _ = msgs.append('============================================================') -%}
+          {%- set _ = msgs.append(' HOST      : ' ~ inventory_hostname) -%}
+          {%- set _ = msgs.append(' BD        : ' ~ db_info_parts[0] | default(oracle_sid)) -%}
+          {%- set _ = msgs.append(' UNIQUE    : ' ~ db_info_parts[1] | default('N/A')) -%}
+          {%- set _ = msgs.append(' OPEN MODE : ' ~ db_info_parts[2] | default('N/A')) -%}
+          {%- set _ = msgs.append(' LOG MODE  : ' ~ db_info_parts[3] | default('N/A')) -%}
+          {%- set _ = msgs.append(' VERSION   : ' ~ db_info_parts[5] | default('N/A')) -%}
+          {%- set _ = msgs.append(' FLASHBACK : ' ~ fb_parts[0] | default('N/A') ~ '  |  Oldest: ' ~ fb_parts[1] | default('N/A')) -%}
+          {%- set _ = msgs.append('------------------------------------------------------------') -%}
+          {%- set _ = msgs.append(' *** ' ~ (rp_lines | length) ~ ' RESTORE POINT(S) ACTIVO(S) ***') -%}
+          {%- set _ = msgs.append('------------------------------------------------------------') -%}
+          {%- for line in rp_lines -%}
+            {%- set c = line.split('|') -%}
+            {%- set dias = c[3] | float | round(1) -%}
+            {%- set alerta = '  *** ALERTA: lleva mas de ' ~ alert_days ~ ' dias activo ***' if dias | float > alert_days | float else '' -%}
+            {%- set _ = msgs.append('') -%}
+            {%- set _ = msgs.append('  Nombre        : ' ~ c[0]) -%}
+            {%- set _ = msgs.append('  Fecha creacion: ' ~ c[2]) -%}
+            {%- set _ = msgs.append('  Antiguedad    : ' ~ dias ~ ' dias' ~ alerta) -%}
+            {%- set _ = msgs.append('  SCN           : ' ~ c[5]) -%}
+            {%- set _ = msgs.append('  Guarantee FB  : ' ~ c[1]) -%}
+            {%- set _ = msgs.append('  Storage usado : ' ~ (c[4] | int / 1073741824) | round(2) ~ ' GB') -%}
+            {%- set _ = msgs.append('  Es PDB RP     : ' ~ c[6]) -%}
+          {%- endfor -%}
+          {%- set _ = msgs.append('============================================================') -%}
+          {{ msgs }}
+      when:
+        - instance_available | bool
+        - rp_lines | default([]) | length > 0
+
+    # ===========================================================
+    # BLOQUE 5 — ESCRIBIR LOG POR HOST
+    # ===========================================================
+    - name: "5 | Escribir log en el servidor"
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ log_file }}"
+        owner: "{{ oracle_os_user | default('oracle') }}"
+        mode: '0640'
+        content: |
+          ================================================================================
+           RESTORE POINTS CHECK
+           Host       : {{ inventory_hostname }}
+           SID        : {{ oracle_sid }}
+           Generado   : {{ ansible_date_time.iso8601 }}
+          ================================================================================
+
+          {% if not instance_available | bool %}
+          INSTANCIA NO DISPONIBLE O NO EN MODO OPEN
+          {% else %}
+          ── INFO DE LA BASE DE DATOS ─────────────────────────────────────────────────────
+            Nombre        : {{ db_info_parts[0] | default('N/A') }}
+            DB Unique     : {{ db_info_parts[1] | default('N/A') }}
+            Open Mode     : {{ db_info_parts[2] | default('N/A') }}
+            Log Mode      : {{ db_info_parts[3] | default('N/A') }}
+            Host          : {{ db_info_parts[4] | default('N/A') }}
+            Version       : {{ db_info_parts[5] | default('N/A') }}
+            Timestamp     : {{ db_info_parts[6] | default('N/A') }}
+            Flashback ON  : {{ fb_parts[0] | default('N/A') }}
+            Oldest FB SCN : {{ fb_parts[2] | default('N/A') }}
+            Oldest FB Time: {{ fb_parts[1] | default('N/A') }}
+
+          ── RESTORE POINTS ───────────────────────────────────────────────────────────────
+          {% if rp_lines | default([]) | length == 0 %}
+            Sin restore points activos.
+          {% else %}
+            Total encontrados: {{ rp_lines | length }}
+
+          {% for line in rp_lines %}
+          {% set c = line.split('|') %}
+          {% set dias = c[3] | float | round(1) %}
+            ┌─ Restore Point #{{ loop.index }} ──────────────────────────────────────────────
+            │  Nombre        : {{ c[0] }}
+            │  Fecha creacion: {{ c[2] }}
+            │  Antiguedad    : {{ dias }} dias{% if dias | float > alert_days | float %}  *** ALERTA: mas de {{ alert_days }} dias ***{% endif %}
+
+            │  SCN           : {{ c[5] }}
+            │  Guarantee FB  : {{ c[1] }}
+            │  Storage usado : {{ (c[4] | int / 1073741824) | round(2) }} GB
+            │  Es PDB RP     : {{ c[6] }}
+            │  Clean PDB RP  : {{ c[7] }}
+            └───────────────────────────────────────────────────────────────────────────────
+          {% endfor %}
+          {% endif %}
+          {% endif %}
+
+          ================================================================================
+           FIN - {{ ansible_date_time.iso8601 }}
+          ================================================================================
+      when: instance_available | bool
+
+    - name: "5 | Descargar log al controller"
+      ansible.builtin.fetch:
+        src:  "{{ report_dir }}/{{ log_file }}"
+        dest: "{{ local_out_dir }}/{{ inventory_hostname }}_{{ log_file }}"
+        flat: true
+      when: instance_available | bool
+
+  # ------------------------------------------------------------
+  # RESUMEN CONSOLIDADO EN EL CONTROLLER
+  # ------------------------------------------------------------
+  post_tasks:
+
+    - name: "POST | Consolidar resumen en el controller"
+      ansible.builtin.lineinfile:
+        path: "{{ local_out_dir }}/RESUMEN_{{ ansible_date_time.date }}.log"
+        create: true
+        line: >-
+          {{ '%s' | format(ansible_date_time.time) }} |
+          {{ '%-15s' | format(inventory_hostname) }} |
+          {{ '%-12s' | format(oracle_sid) }} |
+          {% if not instance_available | bool %}
+          NO DISPONIBLE
+          {% elif rp_lines | default([]) | length == 0 %}
+          OK - Sin restore points
+          {% else %}
+          ALERTA - {{ rp_lines | length }} restore point(s):
+          {% for line in rp_lines %}
+          {% set c = line.split('|') %}
+          {{ c[0] }} ({{ c[3] | float | round(1) }} dias, GFB={{ c[1] }}){% if not loop.last %} / {% endif %}
+          {% endfor %}
+          {% endif %}
+        insertafter: EOF
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: "POST | Mostrar ruta del resumen consolidado"
+      ansible.builtin.debug:
+        msg: "Resumen consolidado: {{ local_out_dir }}/RESUMEN_{{ ansible_date_time.date }}.log"
+      delegate_to: localhost
+      run_once: true
+
+
+
+***********************************************************************************************************************
+---
+# ================================================================
+# PLAYBOOK: oracle_restore_points.yml
+# Consulta si existen restore points activos en bases de datos
+# Oracle 19c Single Instance y muestra un resumen consolidado.
+#
+# Uso:
+#   ansible-playbook -i inventory/hosts.ini oracle_restore_points.yml
+#
+# Parámetros opcionales:
+#   -e "target_host=oradb01"   (limitar a un host concreto, default all)
+#   -e "alert_days=7"          (avisar si el RP tiene más de N días, default 7)
+# ================================================================
+
+- name: "Oracle - Consulta de Restore Points Activos"
+  hosts: "{{ target_host | default('oracle_single_instance') }}"
+  gather_facts: true
+  serial: 5
+  vars:
+    oracle_user:   "/ as sysdba"
+    alert_days:    "{{ alert_days | default(7) }}"
+    report_dir:    "/tmp/oracle_rp_check"
+    log_file:      "restore_points_{{ ansible_date_time.date }}.log"
+    local_out_dir: "/var/ansible/oracle_reports/restore_points"
+
+  # ------------------------------------------------------------
+  pre_tasks:
+
+    - name: "PRE | Crear directorio temporal en servidor"
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_os_user | default('oracle') }}"
+        mode: '0750'
+
+    - name: "PRE | Crear directorio local en controller"
+      ansible.builtin.file:
+        path: "{{ local_out_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+  # ------------------------------------------------------------
+  tasks:
+
+    # ===========================================================
+    # BLOQUE 1 — VERIFICAR INSTANCIA
+    # ===========================================================
+    - name: "1 | Verificar que la instancia está abierta"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        SELECT status FROM v$instance;
+        EXIT;
+        EOF
+      register: r_instance_status
+      changed_when: false
+      failed_when: false
+
+    - name: "1 | Marcar instancia como no disponible"
+      ansible.builtin.set_fact:
+        instance_available: false
+      when: >
+        r_instance_status.rc != 0 or
+        'OPEN' not in r_instance_status.stdout
+
+    - name: "1 | Marcar instancia como disponible"
+      ansible.builtin.set_fact:
+        instance_available: true
+      when: >
+        r_instance_status.rc == 0 and
+        'OPEN' in r_instance_status.stdout
+
+    # ===========================================================
+    # BLOQUE 2 — CONSULTAR RESTORE POINTS
+    # ===========================================================
+    - name: "2 | Consultar restore points en v$restore_point"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            rp.name                                              || '|' ||
+            rp.guarantee_flashback_database                      || '|' ||
+            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')            || '|' ||
+            ROUND((SYSDATE - rp.time), 2)                        || '|' ||
+            NVL(rp.storage_size, 0)                              || '|' ||
+            rp.scn                                               || '|' ||
+            NVL(rp.pdb_restore_point,'NO')                       || '|' ||
+            NVL(rp.clean_pdb_restore_point,'NO')                 || '|' ||
+            NVL(rp.pdb_incarnation#,0)
+        FROM v$restore_point rp
+        ORDER BY rp.time DESC;
+        EXIT;
+        EOF
+      register: r_restore_points
+      changed_when: false
+      when: instance_available | bool
+
+    - name: "2 | Consultar info general de la BD"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            d.name            || '|' ||
+            d.db_unique_name  || '|' ||
+            d.open_mode       || '|' ||
+            d.log_mode        || '|' ||
+            i.host_name       || '|' ||
+            i.version_full    || '|' ||
+            TO_CHAR(SYSDATE,'DD/MM/YYYY HH24:MI:SS')
+        FROM v$database d, v$instance i;
+        EXIT;
+        EOF
+      register: r_db_info
+      changed_when: false
+      when: instance_available | bool
+
+    - name: "2 | Consultar espacio de flashback usado"
+      ansible.builtin.shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
+        SELECT
+            NVL(flashback_on,'NO')                                    || '|' ||
+            NVL(TO_CHAR(oldest_flashback_time,'DD/MM/YYYY HH24:MI'),'N/A') || '|' ||
+            NVL(TO_CHAR(oldest_flashback_scn),'N/A')
+        FROM v$database;
+        EXIT;
+        EOF
+      register: r_flashback_info
+      changed_when: false
+      when: instance_available | bool
+
+    # ===========================================================
+    # BLOQUE 3 — PARSEAR Y GUARDAR FACTS
+    # ===========================================================
+    - name: "3 | Parsear restore points encontrados"
+      ansible.builtin.set_fact:
+        rp_lines: >-
+          {{ r_restore_points.stdout_lines
+             | default([])
+             | select('match', '.+\|.+')
+             | map('trim') | list }}
+      when: instance_available | bool
+
+    - name: "3 | Parsear info de BD"
+      ansible.builtin.set_fact:
+        db_info_parts: "{{ (r_db_info.stdout | trim).split('|') }}"
+      when:
+        - instance_available | bool
+        - r_db_info.stdout is defined
+        - r_db_info.stdout | trim | length > 0
+
+    - name: "3 | Parsear info de flashback"
+      ansible.builtin.set_fact:
+        fb_parts: "{{ (r_flashback_info.stdout | trim).split('|') }}"
+      when:
+        - instance_available | bool
+        - r_flashback_info.stdout is defined
+        - r_flashback_info.stdout | trim | length > 0
+
+    # ===========================================================
+    # BLOQUE 4 — ESCRIBIR LOG POR HOST
+    # ===========================================================
+    - name: "4 | Escribir log en el servidor"
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ log_file }}"
+        owner: "{{ oracle_os_user | default('oracle') }}"
+        mode: '0640'
+        content: |
+          ================================================================================
+           RESTORE POINTS CHECK
+           Host       : {{ inventory_hostname }}
+           SID        : {{ oracle_sid }}
+           Generado   : {{ ansible_date_time.iso8601 }}
+          ================================================================================
+
+          {% if not instance_available | bool %}
+          INSTANCIA NO DISPONIBLE O NO EN MODO OPEN
+          {% else %}
+          ── INFO DE LA BASE DE DATOS ─────────────────────────────────────────────────────
+            Nombre        : {{ db_info_parts[0] | default('N/A') }}
+            DB Unique     : {{ db_info_parts[1] | default('N/A') }}
+            Open Mode     : {{ db_info_parts[2] | default('N/A') }}
+            Log Mode      : {{ db_info_parts[3] | default('N/A') }}
+            Host          : {{ db_info_parts[4] | default('N/A') }}
+            Version       : {{ db_info_parts[5] | default('N/A') }}
+            Timestamp     : {{ db_info_parts[6] | default('N/A') }}
+            Flashback ON  : {{ fb_parts[0] | default('N/A') }}
+            Oldest FB SCN : {{ fb_parts[2] | default('N/A') }}
+            Oldest FB Time: {{ fb_parts[1] | default('N/A') }}
+
+          ── RESTORE POINTS ───────────────────────────────────────────────────────────────
+          {% if rp_lines | default([]) | length == 0 %}
+            Sin restore points activos.
+          {% else %}
+            Total encontrados: {{ rp_lines | length }}
+
+          {% for line in rp_lines %}
+          {% set c = line.split('|') %}
+          {% set dias = c[3] | float | round(1) %}
+            ┌─ Restore Point #{{ loop.index }} ──────────────────────────────────────────────
+            │  Nombre        : {{ c[0] }}
+            │  Fecha creacion: {{ c[2] }}
+            │  Antiguedad    : {{ dias }} dias{% if dias | float > alert_days | float %}  *** ALERTA: mas de {{ alert_days }} dias ***{% endif %}
+
+            │  SCN           : {{ c[5] }}
+            │  Guarantee FB  : {{ c[1] }}
+            │  Storage usado : {{ (c[4] | int / 1073741824) | round(2) }} GB
+            │  Es PDB RP     : {{ c[6] }}
+            │  Clean PDB RP  : {{ c[7] }}
+            └───────────────────────────────────────────────────────────────────────────────
+          {% endfor %}
+          {% endif %}
+          {% endif %}
+
+          ================================================================================
+           FIN - {{ ansible_date_time.iso8601 }}
+          ================================================================================
+      when: instance_available | bool
+
+    - name: "4 | Descargar log al controller"
+      ansible.builtin.fetch:
+        src:  "{{ report_dir }}/{{ log_file }}"
+        dest: "{{ local_out_dir }}/{{ inventory_hostname }}_{{ log_file }}"
+        flat: true
+      when: instance_available | bool
+
+  # ------------------------------------------------------------
+  # RESUMEN CONSOLIDADO EN EL CONTROLLER
+  # ------------------------------------------------------------
+  post_tasks:
+
+    - name: "POST | Consolidar resumen en el controller"
+      ansible.builtin.lineinfile:
+        path: "{{ local_out_dir }}/RESUMEN_{{ ansible_date_time.date }}.log"
+        create: true
+        line: >-
+          {{ '%s' | format(ansible_date_time.time) }} |
+          {{ '%-15s' | format(inventory_hostname) }} |
+          {{ '%-12s' | format(oracle_sid) }} |
+          {% if not instance_available | bool %}
+          NO DISPONIBLE
+          {% elif rp_lines | default([]) | length == 0 %}
+          OK - Sin restore points
+          {% else %}
+          ALERTA - {{ rp_lines | length }} restore point(s):
+          {% for line in rp_lines %}
+          {% set c = line.split('|') %}
+          {{ c[0] }} ({{ c[3] | float | round(1) }} dias, GFB={{ c[1] }}){% if not loop.last %} / {% endif %}
+          {% endfor %}
+          {% endif %}
+        insertafter: EOF
+        mode: '0644'
+      delegate_to: localhost
