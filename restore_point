@@ -438,3 +438,32 @@
           {% endif %}
         insertafter: EOF
       delegate_to: localhost
+======================================================================================================
+======================================================================================================
+  tasks:
+    - name: Consultar restore points activos
+      become: true
+      become_user: "{{ oracle_user }}"
+      shell: |
+        export ORACLE_SID={{ oracle_sid }}
+        export ORACLE_HOME={{ oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<EOF
+        SET PAGESIZE 0
+        SET FEEDBACK OFF
+        SET HEADING OFF
+        SET TRIMSPOOL ON
+        SELECT COUNT(*) FROM v\$restore_point;
+        EXIT;
+        EOF
+      register: rp_count
+      changed_when: false
+
+    - name: Registrar BD con restore points activos
+      set_fact:
+        tiene_restore_points: "{{ rp_count.stdout | trim | int > 0 }}"
+
+    - name: Mostrar BDs con restore points
+      debug:
+        msg: "BD con restore points activos: {{ oracle_sid }} ({{ rp_count.stdout | trim }} restore point(s))"
+      when: tiene_restore_points
