@@ -63,6 +63,60 @@
           restore_points: "{{ rp_lines }}"
           status: "{{ 'CON RESTORE POINTS ⚠️' if rp_lines | length > 0 else 'OK ✅' }}"
           error: "{{ rp_output.stderr | default('') }}"
+   - name: Escribir resultado en log - CON restore points
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          RESULTADO: ⚠️  SE ENCONTRARON {{ rp_lines | length }} RESTORE POINT(S) ACTIVOS
+
+          DETALLE:
+          {% for rp in rp_lines %}
+          {% set campos = rp.split('|') %}
+            Nombre     : {{ campos[0] | trim }}
+            Fecha/Hora : {{ campos[1] | trim }}
+            Garantizado: {{ campos[2] | trim }}
+            Tamaño     : {{ campos[3] | trim }} bytes
+            --------------------------------------------------
+          {% endfor %}
+
+          SALIDA RAW SQLPLUS:
+          {{ rp_output.stdout }}
+        marker: "# {mark} RESULTADO CONSULTA"
+      when: rp_lines | length > 0
+
+    - name: Escribir resultado en log - SIN restore points
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          RESULTADO: ✅ No se encontraron Restore Points activos.
+
+          SALIDA RAW SQLPLUS:
+          {{ rp_output.stdout | default('(sin salida)') }}
+        marker: "# {mark} RESULTADO CONSULTA"
+      when: rp_lines | length == 0
+
+    - name: Escribir errores en log si los hay
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          ⚠️  ERRORES DETECTADOS:
+          {{ rp_output.stderr }}
+        marker: "# {mark} ERRORES"
+      when: rp_output.stderr is defined and rp_output.stderr != ''
+
+    - name: Escribir pie del log
+      lineinfile:
+        path: "{{ log_file }}"
+        line: |
+
+          ============================================================
+          FIN DE CONSULTA - {{ ansible_date_time.iso8601 }}
+          ============================================================
+        insertafter: EOF
+
+    - name: Mostrar ruta del log generado
+      debug:
+        msg: "Log generado en {{ inventory_hostname }}:{{ log_file }}"
 
 - name: Generar resumen consolidado
   hosts: localhost
