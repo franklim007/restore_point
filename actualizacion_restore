@@ -9,6 +9,20 @@
     oracle_sid: "ORCL"
 
   tasks:
+    - name: Escribir cabecera del log
+      copy:
+        dest: "{{ log_file }}"
+        content: |
+          ============================================================
+          CONSULTA RESTORE POINTS ORACLE
+          ============================================================
+          Host         : {{ inventory_hostname }}
+          IP           : {{ ansible_default_ipv4.address | default('N/A') }}
+          SID          : {{ oracle_sid }}
+          Fecha/Hora   : {{ ansible_date_time.iso8601 }}
+          Usuario      : {{ ansible_user_id }}
+          ============================================================
+
     - name: Contar y obtener restore points activos
       shell: |
         export ORACLE_SID={{ oracle_sid }}
