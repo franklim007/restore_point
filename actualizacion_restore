@@ -1,0 +1,141 @@
+---
+- name: Consultar Restore Points activos en Oracle - Resumen Global
+  hosts: oracle_servers
+  become: yes
+  become_user: oracle
+  gather_facts: false
+  vars:
+    oracle_home: "/u01/app/oracle/product/19c/dbhome_1"
+    oracle_sid: "ORCL"
+
+  tasks:
+    - name: Contar y obtener restore points activos
+      shell: |
+        export ORACLE_SID={{ oracle_sid }}
+        export ORACLE_HOME={{ oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<EOF
+        SET PAGESIZE 0
+        SET FEEDBACK OFF
+        SET HEADING OFF
+        SET COLSEP '|'
+        SELECT
+            NAME || '|' ||
+            TO_CHAR(TIME, 'DD/MM/YYYY HH24:MI:SS') || '|' ||
+            GUARANTEE_FLASHBACK_DATABASE || '|' ||
+            STORAGE_SIZE
+        FROM V\$RESTORE_POINT
+        ORDER BY TIME DESC;
+        EXIT;
+        EOF
+      register: rp_output
+      ignore_errors: true
+
+    - name: Guardar resultado por host
+      set_fact:
+        rp_lines: >-
+          {{
+            rp_output.stdout_lines
+            | select('match', '.+\\|.+\\|.+\\|.+')
+            | list
+          }}
+
+    - name: Marcar host con o sin restore points
+      set_fact:
+        host_summary:
+          host: "{{ inventory_hostname }}"
+          sid: "{{ oracle_sid }}"
+          count: "{{ rp_lines | length }}"
+          restore_points: "{{ rp_lines }}"
+          status: "{{ 'CON RESTORE POINTS ⚠️' if rp_lines | length > 0 else 'OK ✅' }}"
+          error: "{{ rp_output.stderr | default('') }}"
+
+- name: Generar resumen consolidado
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Consolidar resultados de todos los hosts
+      set_fact:
+        all_summaries: >-
+          {{
+            groups['oracle_servers']
+            | map('extract', hostvars, 'host_summary')
+            | list
+          }}
+
+    - name: Filtrar solo los que tienen restore points
+      set_fact:
+        with_rp: "{{ all_summaries | selectattr('count', '>', '0') | list }}"
+        without_rp: "{{ all_summaries | selectattr('count', '==', '0') | list }}"
+        with_errors: "{{ all_summaries | selectattr('error', '!=', '') | list }}"
+
+    - name: Mostrar resumen ejecutivo
+      debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════╗
+          ║         RESUMEN GLOBAL DE RESTORE POINTS ORACLE          ║
+          ╚══════════════════════════════════════════════════════════╝
+
+          📊 ESTADÍSTICAS:
+             Total servidores chequeados : {{ all_summaries | length }}
+             Con restore points activos  : {{ with_rp | length }}
+             Sin restore points          : {{ without_rp | length }}
+             Con errores de conexión     : {{ with_errors | length }}
+
+    - name: Mostrar detalle de servidores CON restore points
+      debug:
+        msg: |
+          ⚠️  {{ item.host }} (SID: {{ item.sid }}) — {{ item.count }} restore point(s):
+          {% for rp in item.restore_points %}
+            → {{ rp }}
+          {% endfor %}
+      loop: "{{ with_rp }}"
+      when: with_rp | length > 0
+
+    - name: Mostrar servidores SIN restore points
+      debug:
+        msg: "✅ Sin restore points: {{ without_rp | map(attribute='host') | join(', ') }}"
+      when: without_rp | length > 0
+
+    - name: Mostrar servidores con errores
+      debug:
+        msg: "❌ Error en {{ item.host }}: {{ item.error }}"
+      loop: "{{ with_errors }}"
+      when: with_errors | length > 0
+
+    - name: Guardar resumen en fichero CSV
+      copy:
+        dest: "/tmp/restore_points_report_{{ ansible_date_time.date }}.csv"
+        content: |
+          HOST,SID,RESTORE_POINTS,STATUS,DETALLE
+          {% for s in all_summaries %}
+          {{ s.host }},{{ s.sid }},{{ s.count }},{{ s.status }},"{{ s.restore_points | join(' / ') }}"
+          {% endfor %}
+      delegate_to: localhost
+```
+
+---
+
+### Lo que obtienes al final
+```
+╔══════════════════════════════════════════════════════════╗
+║         RESUMEN GLOBAL DE RESTORE POINTS ORACLE          ║
+╚══════════════════════════════════════════════════════════╝
+
+📊 ESTADÍSTICAS:
+   Total servidores chequeados : 25
+   Con restore points activos  : 3
+   Sin restore points          : 21
+   Con errores de conexión     : 1
+
+⚠️  db-server-04 (SID: PROD1) — 2 restore point(s):
+  → PRE_PATCH_20250101|01/01/2025 08:00:00|YES|10485760000
+  → TEST_RP|15/01/2025 12:30:00|NO|5242880000
+
+⚠️  db-server-11 (SID: FINDB) — 1 restore point(s):
+  → BEFORE_MIGRATION|10/02/2025 09:15:00|YES|20971520000
+
+✅ Sin restore points: db-server-01, db-server-02, db-server-03 ...
+
+❌ Error en db-server-17: ORA-01034: ORACLE not available
