@@ -1,0 +1,136 @@
+---
+- name: "Oracle - Resumen BDs con Restore Points Activos"
+  hosts: "{{ target_host | default('oracle_single_instance') }}"
+  gather_facts: true
+  serial: 5
+  vars:
+    oracle_user:   "/ as sysdba"
+    report_dir:    "/tmp/oracle_rp_check"
+    log_file:      "restore_points_{{ ansible_date_time.date }}.log"
+    local_out_dir: "/var/ansible/oracle_reports/restore_points"
+    resumen_file:  "{{ local_out_dir }}/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
+
+  pre_tasks:
+
+    - name: "PRE | Crear directorio temporal en servidor"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: "{{ oracle_os_user | default('oracle') }}"
+        mode: '0750'
+
+    - name: "PRE | Crear directorio local en controller"
+      file:
+        path: "{{ local_out_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: "PRE | Inicializar fichero de resumen (solo primera vez)"
+      ansible.builtin.copy:
+        dest: "{{ resumen_file }}"
+        content: |
+          ================================================================================
+           BASES DE DATOS CON RESTORE POINTS ACTIVOS
+           Fecha: {{ ansible_date_time.date }}
+          ================================================================================
+        force: false
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+
+  tasks:
+
+    - name: "1 | Consultar restore points"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            NVL(p.name, 'CDB$ROOT')                         || '|' ||
+            rp.name                                         || '|' ||
+            rp.guarantee_flashback_database                 || '|' ||
+            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')       || '|' ||
+            ROUND((SYSDATE - rp.time), 2)                  || '|' ||
+            NVL(rp.storage_size, 0)                        || '|' ||
+            rp.scn
+        FROM cdb_restore_points rp
+        LEFT JOIN v$pdbs p ON rp.con_id = p.con_id
+        ORDER BY p.name NULLS FIRST, rp.time DESC;
+        EXIT;
+        EOF
+      register: r_restore_points
+      changed_when: false
+
+    - name: "1 | Consultar info general de la BD"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
+        SELECT
+            d.name           || '|' ||
+            d.db_unique_name || '|' ||
+            i.host_name      || '|' ||
+            i.version_full
+        FROM v$database d, v$instance i;
+        EXIT;
+        EOF
+      register: r_db_info
+      changed_when: false
+
+    - name: "2 | Parsear restore points"
+      set_fact:
+        rp_lines: >-
+          {{ r_restore_points.stdout_lines
+             | select('match', '.+\|.+')
+             | map('trim') | list }}
+
+    - name: "2 | Parsear info de BD"
+      set_fact:
+        db_info_parts: "{{ r_db_info.stdout | trim | split('|') }}"
+
+    # Solo escribe en el resumen si hay restore points
+    - name: "3 | Añadir al resumen solo BDs con restore points"
+      blockinfile:
+        path: "{{ resumen_file }}"
+        marker: "# {mark} {{ inventory_hostname }}_{{ oracle_sid }}"
+        block: |
+
+          Host         : {{ inventory_hostname }}
+          BD           : {{ db_info_parts[0] }} ({{ db_info_parts[1] }})
+          Versión      : {{ db_info_parts[3] }}
+          ──────────────────────────────────────────────────────────────────────────────
+          {% for line in rp_lines %}
+          {% set c = line.split('|') %}
+            · Contenedor : {{ c[0] }}
+              Nombre     : {{ c[1] }}
+              Creado     : {{ c[3] }}
+              Antigüedad : {{ c[4] | float | round(1) }} días
+              SCN        : {{ c[6] }}
+              Guaranteed : {{ c[2] }}
+              Storage    : {{ (c[5] | int / 1073741824) | round(2) }} GB
+          {% endfor %}
+        insertafter: EOF
+        mode: '0644'
+      delegate_to: localhost
+      when: rp_lines | length > 0
+
+  post_tasks:
+
+    - name: "POST | Añadir pie de resumen al final"
+      lineinfile:
+        path: "{{ resumen_file }}"
+        line: |
+
+          ================================================================================
+           FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
+          ================================================================================
+        insertafter: EOF
+      delegate_to: localhost
+      run_once: true
