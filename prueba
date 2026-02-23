@@ -1,0 +1,207 @@
+---
+- name: Monitorizacion
+  hosts: all #"{{ target_group }}"
+  gather_facts: yes
+  vars:
+   reports_dir: "/tmp/ansible/"
+   reports_salida: "/tmp/ansible/salida/"
+   log_file: "{{ reports_salida }}restore_points_{{ inventory_hostname }}_{{ ansible_date_time.date }}.log"
+  vars_files:
+    - vars_multi.yml
+  tasks:
+    ################################################
+    # variables necesarias para multitenant
+    ##########################################3
+    - name: SACAR OHOME CDBS
+      shell: cat /home/oracle/{{ cdb }}.env | grep -w "ORACLE_HOME" | cut -d';' -f1 | cut -d'=' -f2 #>> /admin/oracle/uti/ohome_cdbs_{{ ansible_hostname}}{{cdb}}.txt
+      register: home_cdb
+      tags: always
+    - name: SACAR UNIQNAME
+      shell: cat /home/oracle/{{ cdb }}.env | grep -w "ORACLE_UNQNAME" | cut -d';' -f1 | cut -d'=' -f2 #>> /admin/oracle/uti/ohome_cdbs_{{ ansible_hostname}}{{cdb}}.txt
+      register: cdb_unqname
+      tags: always #ulnqname
+    - debug:
+        msg: "{{ cdb_unqname.stdout}}"
+      tags: always  #unqname
+    - name: Create folder reports_dir
+      file:
+        path: "{{ reports_dir }}"
+        state: directory
+        mode: '0755'
+    - name: Create folder reports_salida
+      file:
+        path: "{{ reports_salida }}"
+        state: directory
+        mode: '0755'
+      tags: always
+    # ==============================================
+    #  GENERAR REPORTE
+    # ==========================
+    - name: Generar reporte
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        SELECT cdb FROM v$database;
+        EXIT;
+        EOF
+      register: is_cdb
+      changed_when: false
+    - name: Establecemos si es CDB
+      set_fact:
+         is_multitenant: "{{ 'YES' in is_cdb.stdout }}"
+    - name: Mostrar tipo de arquitectura
+      debug:
+        msg: |
+          Servidor: {{ inventory_hostname }}
+          Arquitectura: {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB (Single Instance)' }}
+    - name: Obtener lista de pdbs
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        select name || '|' || con_id || '|' || open_mode from v\$pdbs order by con_id;
+        EXIT;
+        EOF
+      register: pdbs_list
+      when: is_multitenant
+      changed_when: false
+
+    - name: Parsear informacion PDBs
+      set_fact:
+        pdbs: "{{ pdbs | default([]) +
+                  [ {
+                    'name': item.split('|')[0],
+                    'con_id': item.split('|')[1],
+                    'open_mode': item.split('|')[2]
+                  } ]
+               }}"
+      with_items: "{{ pdbs_list.stdout_lines }}"
+      when:
+        - is_multitenant
+        - pdbs_list is defined
+        - item | length > 0
+    - name: Mostrar PDBs encontradas
+      debug:
+        msg: |
+          PDBs encontradas en {{ inventory_hostname }}:
+          {% for pdb in pdbs | default([]) %}
+          - {{ pdb.name }} (CON_ID: {{ pdb.con_id }}) - Estado: {{ pdb.open_mode }}
+          {% endfor %}
+      when: is_multitenant
+
+
+# =========================================
+# REPORTE RESTORE POINT
+# ===============================
+    - name: Escribir cabecera del log
+      copy:
+        dest: "{{ log_file }}"
+        content: |
+          ============================================================
+          CONSULTA RESTORE POINTS ORACLE
+          ============================================================
+          Host         : {{ inventory_hostname }}
+          IP           : {{ ansible_default_ipv4.address | default('N/A') }}
+          SID          : {{ oracle_sid }}
+          Fecha/Hora   : {{ ansible_date_time.iso8601 }}
+          Usuario      : {{ ansible_user_id }}
+          ============================================================
+
+    - name: Consultar Restore Point de v$restore_point
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        echo "
+        SET PAGESIZE 1000 LINESIZE 200 FEEDBACK OFF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            NAME || '|' ||
+            TO_CHAR(TIME, 'DD/MM/YYYY HH24:MI:SS') || '|' ||
+            GUARANTEE_FLASHBACK_DATABASE || '|' ||
+            STORAGE_SIZE
+        FROM V\$RESTORE_POINT
+        ORDER BY TIME DESC;
+        EXIT;
+        " | sqlplus -s / as sysdba
+      register: rp_output
+      ignore_errors: true
+
+    - name: Guardar resultado por host
+      set_fact:
+        rp_lines: >-
+          {{
+            rp_output.stdout_lines
+            | select('match', '.+\\|.+\\|.+\\|.+')
+            | list
+          }}
+
+    - name: Marcar host con o sin restore points
+      set_fact:
+        host_summary:
+          host: "{{ inventory_hostname }}"
+          sid: "{{ oracle_sid }}"
+          count: "{{ rp_lines | length }}"
+          restore_points: "{{ rp_lines }}"
+          status: "{{ 'CON RESTORE POINTS ⚠️' if rp_lines | length > 0 else 'OK ✅' }}"
+          error: "{{ rp_output.stderr | default('') if rp_output is defined else 'Error ejecuntado Sqlplus' }}"
+    - name: Escribir resultado en log - CON restore points
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          RESULTADO: ⚠️  SE ENCONTRARON {{ rp_lines | length }} RESTORE POINT(S) ACTIVOS
+
+          DETALLE:
+          {% for rp in rp_lines %}
+          {% set campos = rp.split('|') %}
+          {% if campos | length >= 4 %}
+            Nombre     : {{ campos[0] | trim }}
+            Fecha/Hora : {{ campos[1] | trim }}
+            Garantizado: {{ campos[2] | trim }}
+            Tamaño     : {{ campos[3] | trim }} bytes
+          {% else %}
+            RAW: {{ rp }}
+          {% endif %}
+            --------------------------------------------------
+          {% endfor %}
+
+#          SALIDA RAW SQLPLUS:
+#          {{ rp_output.stdout }}
+#        marker: "# {mark} RESULTADO CONSULTA"
+#      when: rp_lines | length > 0
+
+    - name: Escribir resultado en log - SIN restore points
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          RESULTADO: ✅ No se encontraron Restore Points activos.
+
+          SALIDA RAW SQLPLUS:
+          {{ rp_output.stdout | default('(sin salida)') }}
+        marker: "# {mark} RESULTADO CONSULTA"
+      when: rp_lines | length == 0
+
+    - name: Escribir errores en log si los hay
+      blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          ⚠️  ERRORES DETECTADOS:
+          {{ rp_output.stderr }}
+        marker: "# {mark} ERRORES"
+      when: rp_output.stderr is defined and rp_output.stderr != ''
+
+    - name: Escribir pie del log
+      lineinfile:
+        path: "{{ log_file }}"
+        line: |
+
+          ============================================================
+          FIN DE CONSULTA - {{ ansible_date_time.iso8601 }}
+          ============================================================
+        insertafter: EOF
