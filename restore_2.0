@@ -1,235 +1,19 @@
 ---
-- name: "Oracle - Resumen BDs con Restore Points Activos"
-  hosts: "{{ target_host | default('oracle_single_instance') }}"
+- name: "Oracle - Check Restore Points CDB y PDBs"
+  hosts: "{{ target_host | default('oracle_servers') }}"
   gather_facts: true
   serial: 5
   vars:
-    oracle_user:   "/ as sysdba"
-    report_dir:    "/tmp/oracle_rp_check"
-    log_file:      "restore_points_{{ ansible_date_time.date }}.log"
-    local_out_dir: "/var/ansible/oracle_reports/restore_points"
-    resumen_file:  "{{ local_out_dir }}/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
-
-  pre_tasks:
-
-    - name: "PRE | Crear directorio temporal en servidor"
-      file:
-        path: "{{ report_dir }}"
-        state: directory
-        owner: "{{ oracle_os_user | default('oracle') }}"
-        mode: '0750'
-
-    - name: "PRE | Crear directorio local en controller"
-      file:
-        path: "{{ local_out_dir }}"
-        state: directory
-        mode: '0755'
-      delegate_to: localhost
-      run_once: true
-
-    - name: "PRE | Inicializar fichero de resumen (solo primera vez)"
-      ansible.builtin.copy:
-        dest: "{{ resumen_file }}"
-        content: |
-          ================================================================================
-           BASES DE DATOS CON RESTORE POINTS ACTIVOS
-           Fecha: {{ ansible_date_time.date }}
-          ================================================================================
-        force: false
-        mode: '0644'
-      delegate_to: localhost
-      run_once: true
-
-  tasks:
-
-    - name: "1 | Consultar restore points"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        export ORACLE_SID={{ oracle_sid }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        sqlplus -s "{{ oracle_user }}" << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
-        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
-        SELECT
-            NVL(p.name, 'CDB$ROOT')                         || '|' ||
-            rp.name                                         || '|' ||
-            rp.guarantee_flashback_database                 || '|' ||
-            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')       || '|' ||
-            ROUND((SYSDATE - rp.time), 2)                  || '|' ||
-            NVL(rp.storage_size, 0)                        || '|' ||
-            rp.scn
-        FROM cdb_restore_points rp
-        LEFT JOIN v$pdbs p ON rp.con_id = p.con_id
-        ORDER BY p.name NULLS FIRST, rp.time DESC;
-        EXIT;
-        EOF
-      register: r_restore_points
-      changed_when: false
-
-    - name: "1 | Consultar info general de la BD"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        export ORACLE_SID={{ oracle_sid }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        sqlplus -s "{{ oracle_user }}" << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 200
-        SELECT
-            d.name           || '|' ||
-            d.db_unique_name || '|' ||
-            i.host_name      || '|' ||
-            i.version_full
-        FROM v$database d, v$instance i;
-        EXIT;
-        EOF
-      register: r_db_info
-      changed_when: false
-
-    - name: "2 | Parsear restore points"
-      set_fact:
-        rp_lines: >-
-          {{ r_restore_points.stdout_lines
-             | select('match', '.+\|.+')
-             | map('trim') | list }}
-
-    - name: "2 | Parsear info de BD"
-      set_fact:
-        db_info_parts: "{{ r_db_info.stdout | trim | split('|') }}"
-
-    # Solo escribe en el resumen si hay restore points
-    - name: "3 | Añadir al resumen solo BDs con restore points"
-      blockinfile:
-        path: "{{ resumen_file }}"
-        marker: "# {mark} {{ inventory_hostname }}_{{ oracle_sid }}"
-        block: |
-
-          Host         : {{ inventory_hostname }}
-          BD           : {{ db_info_parts[0] }} ({{ db_info_parts[1] }})
-          Versión      : {{ db_info_parts[3] }}
-          ──────────────────────────────────────────────────────────────────────────────
-          {% for line in rp_lines %}
-          {% set c = line.split('|') %}
-            · Contenedor : {{ c[0] }}
-              Nombre     : {{ c[1] }}
-              Creado     : {{ c[3] }}
-              Antigüedad : {{ c[4] | float | round(1) }} días
-              SCN        : {{ c[6] }}
-              Guaranteed : {{ c[2] }}
-              Storage    : {{ (c[5] | int / 1073741824) | round(2) }} GB
-          {% endfor %}
-        insertafter: EOF
-        mode: '0644'
-      delegate_to: localhost
-      when: rp_lines | length > 0
-
-  post_tasks:
-
-    - name: "POST | Añadir pie de resumen al final"
-      lineinfile:
-        path: "{{ resumen_file }}"
-        line: |
-
-          ================================================================================
-           FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
-          ================================================================================
-        insertafter: EOF
-      delegate_to: localhost
-      run_once: true
-=================================================================================================================================
----------------   OTRA
-==================================================================================================================================
-- name: "1 | Consultar restore points por cada CDB"
-      ansible.builtin.shell: |
-        export ORACLE_HOME={{ item.oracle_home }}
-        export ORACLE_SID={{ item.oracle_sid }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        sqlplus -s "{{ oracle_user }}" << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
-        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
-SELECT
-    rp.name                                         || '|' ||
-    rp.guarantee_flashback_database                 || '|' ||
-    TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')       || '|' ||
-    ROUND((SYSDATE - rp.time), 2)                  || '|' ||
-    NVL(rp.storage_size, 0)                        || '|' ||
-    rp.scn
-FROM v$restore_point rp
-ORDER BY rp.time DESC;
-        EXIT;
-        EOF
-      register: r_restore_points
-      changed_when: false
-      become: true
-      become_user: "{{ oracle_os_user | default('oracle') }}"
-      loop: "{{ oracle_databases }}"
-      loop_control:
-        label: "{{ item.oracle_sid }}"
-  - name: "2 | Separar CDB y PDB restore points"
-      ansible.builtin.set_fact:
-        rp_list: "{{ r_restore_points.stdout_lines | select('match', '.+\|.+') | list }}"
-
-    - name: "3 | Escribir en resumen solo si hay restore points"
-      ansible.builtin.blockinfile:
-        ...
-        block: |
-          {% for line in rp_list %}
-          {% set c = line.split('|') %}
-            · Nombre     : {{ c[0] }}
-              Guaranteed : {{ c[1] }}
-              Creado     : {{ c[2] }}
-              Antigüedad : {{ c[3] | float | round(1) }} días
-              Storage    : {{ (c[4] | int / 1073741824) | round(2) }} GB
-              SCN        : {{ c[5] }}
-          {% endfor %}
-
-El resumen resultante quedará así:
-```
-================================================================================
- BASES DE DATOS CON RESTORE POINTS ACTIVOS
- Fecha: 2026-02-22
-================================================================================
-
-Host         : oradb01
-CDB          : CDB1
-BD Info      : CDB1 (CDB1_UNIQUE)
-Versión      : 19.0.0.0.0
-──────────────────────────────────────────────────────────────────────────────
-[CDB - Restore Points]
-  · Contenedor : CDB$ROOT
-    Nombre     : RP_BEFORE_PATCH
-    Creado     : 15/02/2026 10:30:00
-    Antigüedad : 7.2 días
-    SCN        : 12345678
-    Guaranteed : YES
-    Storage    : 0.5 GB
-
-[PDB - Restore Points]
-  · PDB        : PDB_VENTAS
-    Nombre     : RP_PDB_VENTAS_PRE
-    Creado     : 18/02/2026 08:00:00
-    Antigüedad : 4.1 días
-    SCN        : 12349999
-    Guaranteed : NO
-    Storage    : 0.12 GB
-    Es PDB RP  : YES
-    Clean PDB  : NO********************
-
-
-
-**************************************************
----
-- name: "Oracle - Resumen BDs con Restore Points Activos"
-  hosts: "{{ target_host | default('oracle_single_instance') }}"
-  gather_facts: true
-  serial: 5
-  vars:
-    oracle_user:    "/ as sysdba"
     oracle_os_user: "oracle"
+    oracle_user:    "/ as sysdba"
+    env_file:       "/home/oracle/{{ cdb }}.env"
     local_out_dir:  "/ansible_restore_point"
+    log_file:       "{{ local_out_dir }}/{{ inventory_hostname }}_{{ cdb }}_{{ ansible_date_time.date }}.log"
     resumen_file:   "{{ local_out_dir }}/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
 
   pre_tasks:
 
-    - name: "PRE | Crear directorio local en controller"
+    - name: "PRE | Crear directorio de salida en controller"
       ansible.builtin.file:
         path: "{{ local_out_dir }}"
         state: directory
@@ -237,12 +21,12 @@ Versión      : 19.0.0.0.0
       delegate_to: localhost
       run_once: true
 
-    - name: "PRE | Inicializar fichero de resumen (solo primera vez)"
+    - name: "PRE | Inicializar fichero resumen"
       ansible.builtin.copy:
         dest: "{{ resumen_file }}"
         content: |
           ================================================================================
-           RESTORE POINTS ACTIVOS - {{ ansible_date_time.date }}
+           BASES DE DATOS CON RESTORE POINTS ACTIVOS - {{ ansible_date_time.date }}
           ================================================================================
         force: false
         mode: '0644'
@@ -251,37 +35,53 @@ Versión      : 19.0.0.0.0
 
   tasks:
 
-    - name: "1 | Obtener ORACLE_HOME desde fichero env"
+    - name: "1 | Consultar restore points en CDB y todas sus PDBs"
       ansible.builtin.shell: |
-        source /home/oracle/{{ cdb }}.env
-        echo $ORACLE_HOME
-      register: r_oracle_home
-      changed_when: false
-      become: true
-      become_user: "{{ oracle_os_user }}"
-      args:
-        executable: /bin/bash
-
-    - name: "1 | Guardar ORACLE_HOME como variable"
-      ansible.builtin.set_fact:
-        oracle_home: "{{ r_oracle_home.stdout | trim }}"
-
-    - name: "1 | Consultar restore points CDB y PDBs"
-      ansible.builtin.shell: |
-        source /home/oracle/{{ cdb }}.env
+        source {{ env_file }}
         sqlplus -s "{{ oracle_user }}" << 'EOF'
         SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        SET SERVEROUTPUT ON SIZE UNLIMITED
         ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+
+        -- CDB$ROOT
         SELECT
-            con$name                                    || '|' ||
-            name                                        || '|' ||
-            guarantee_flashback_database                || '|' ||
-            TO_CHAR(time,'DD/MM/YYYY HH24:MI:SS')      || '|' ||
-            ROUND((SYSDATE - time), 2)                 || '|' ||
-            NVL(storage_size, 0)                       || '|' ||
-            scn
-        FROM containers(v$restore_point)
-        ORDER BY con$name, time DESC;
+            'CDB$ROOT'                                  || '|' ||
+            rp.name                                     || '|' ||
+            rp.guarantee_flashback_database             || '|' ||
+            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')   || '|' ||
+            ROUND((SYSDATE - rp.time), 2)              || '|' ||
+            NVL(rp.storage_size, 0)                    || '|' ||
+            rp.scn
+        FROM v\$restore_point rp;
+
+        -- PDBs
+        DECLARE
+            CURSOR c_pdbs IS
+                SELECT name FROM v\$pdbs
+                WHERE name NOT IN ('PDB\$SEED')
+                AND open_mode = 'READ WRITE';
+        BEGIN
+            FOR r_pdb IN c_pdbs LOOP
+                EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER=' || r_pdb.name;
+                FOR r_rp IN (
+                    SELECT name, guarantee_flashback_database,
+                           time, storage_size, scn
+                    FROM v\$restore_point
+                ) LOOP
+                    DBMS_OUTPUT.PUT_LINE(
+                        r_pdb.name                                  || '|' ||
+                        r_rp.name                                   || '|' ||
+                        r_rp.guarantee_flashback_database           || '|' ||
+                        TO_CHAR(r_rp.time,'DD/MM/YYYY HH24:MI:SS') || '|' ||
+                        ROUND((SYSDATE - r_rp.time), 2)            || '|' ||
+                        NVL(r_rp.storage_size, 0)                  || '|' ||
+                        r_rp.scn
+                    );
+                END LOOP;
+                EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER=CDB\$ROOT';
+            END LOOP;
+        END;
+        /
         EXIT;
         EOF
       register: r_restore_points
@@ -291,11 +91,39 @@ Versión      : 19.0.0.0.0
       args:
         executable: /bin/bash
 
-    - name: "2 | Parsear restore points"
+    - name: "2 | Parsear lineas validas"
       ansible.builtin.set_fact:
-        rp_list: "{{ r_restore_points.stdout_lines | select('match', '.+\|.+') | list }}"
+        rp_list: "{{ r_restore_points.stdout_lines | select('match', '.+\\|.+\\|.+') | list }}"
 
-    - name: "3 | Escribir resultado en resumen"
+    - name: "3 | Guardar log individual por CDB"
+      ansible.builtin.copy:
+        dest: "{{ log_file }}"
+        mode: '0644'
+        content: |
+          ================================================================================
+           Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
+           Fecha: {{ ansible_date_time.iso8601 }}
+          ================================================================================
+          {% if rp_list | length == 0 %}
+          Sin restore points activos.
+          {% else %}
+          Total restore points encontrados: {{ rp_list | length }}
+          ──────────────────────────────────────────────────────────────────────────────
+          {% for line in rp_list %}
+          {% set c = line.split('|') %}
+            · Contenedor : {{ c[0] }}
+              Nombre     : {{ c[1] }}
+              Guaranteed : {{ c[2] }}
+              Creado     : {{ c[3] }}
+              Antigüedad : {{ c[4] | float | round(1) }} días
+              Storage    : {{ (c[5] | int / 1073741824) | round(2) }} GB
+              SCN        : {{ c[6] }}
+          {% endfor %}
+          {% endif %}
+          ================================================================================
+      delegate_to: localhost
+
+    - name: "4 | Añadir al resumen solo las CDBs con restore points"
       ansible.builtin.blockinfile:
         path: "{{ resumen_file }}"
         marker: "# {mark} {{ inventory_hostname }}_{{ cdb }}"
@@ -304,11 +132,6 @@ Versión      : 19.0.0.0.0
           ┌──────────────────────────────────────────────────────────────────────────────
           │ Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
           ├──────────────────────────────────────────────────────────────────────────────
-          {% if rp_list | length == 0 %}
-          │ No existen restore points activos
-          {% else %}
-          │ Total restore points: {{ rp_list | length }}
-          │
           {% for line in rp_list %}
           {% set c = line.split('|') %}
           │  · Contenedor : {{ c[0] }}
@@ -320,11 +143,11 @@ Versión      : 19.0.0.0.0
           │    SCN        : {{ c[6] }}
           │
           {% endfor %}
-          {% endif %}
           └──────────────────────────────────────────────────────────────────────────────
         insertafter: EOF
         mode: '0644'
       delegate_to: localhost
+      when: rp_list | length > 0
 
   post_tasks:
 
@@ -334,43 +157,32 @@ Versión      : 19.0.0.0.0
         line: |
 
           ================================================================================
-           FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
+           FIN - {{ ansible_date_time.iso8601 }}
           ================================================================================
         insertafter: EOF
       delegate_to: localhost
       run_once: true
 ```
 
-La salida del fichero quedará así:
+---
+
+## Resultado en `/ansible_restore_point/`
 ```
-================================================================================
- RESTORE POINTS ACTIVOS - 2026-02-23
-================================================================================
+# Log individual por cada CDB (todas, tengan o no restore points)
+oradb01_CDB1_2026-02-23.log
+oradb02_CDB2_2026-02-23.log
+oradb03_CDB3_2026-02-23.log
 
-┌──────────────────────────────────────────────────────────────────────────────
-│ Host : oradb01  |  CDB : CDB1
-├──────────────────────────────────────────────────────────────────────────────
-│ Total restore points: 2
-│
-│  · Contenedor : CDB$ROOT
-│    Nombre     : RP_BEFORE_PATCH
-│    Guaranteed : YES
-│    Creado     : 16/02/2026 10:00:00
-│    Antigüedad : 7.0 días
-│    Storage    : 0.50 GB
-│    SCN        : 12345678
-│
-│  · Contenedor : PDB_VENTAS
-│    Nombre     : RP_PDB_VENTAS
-│    Guaranteed : NO
-│    Creado     : 18/02/2026 08:00:00
-│    Antigüedad : 5.0 días
-│    Storage    : 0.12 GB
-│    SCN        : 12349999
-│
-└──────────────────────────────────────────────────────────────────────────────
+# Resumen consolidado (solo las que tienen restore points)
+RESUMEN_CON_RP_2026-02-23.txt
+```
 
-┌──────────────────────────────────────────────────────────────────────────────
-│ Host : oradb02  |  CDB : CDB2
-├──────────────────────────────────────────────────────────────────────────────
-│ No existen restore points activos
+---
+
+## Flujo resumido
+```
+Por cada host/CDB
+    ├── Consulta CDB$ROOT  → v$restore_point
+    ├── Consulta cada PDB  → ALTER SESSION SET CONTAINER + v$restore_point
+    ├── Guarda log individual (todas)
+    └── Si tiene restore points → añade al resumen consolidado
