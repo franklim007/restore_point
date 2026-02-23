@@ -287,3 +287,31 @@ restore_points_oradb02_2026-02-23.log
 
 # Resumen consolidado (solo los que tienen restore points)
 RESUMEN_CON_RP_2026-02-23.txt
+
+
+*************************************************************************************************************************************************************************
+post_tasks:
+
+    - name: "POST | Pie del resumen consolidado"
+      ansible.builtin.lineinfile:
+        path: "{{ resumen_file }}"
+        line: |
+          ============================================================
+          FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
+          ============================================================
+        insertafter: EOF
+      run_once: true
+
+    - name: "POST | Traer log individual solo si tiene restore points"
+      ansible.builtin.fetch:
+        src:  "{{ log_file }}"
+        dest: "/ansible_restore_point/{{ inventory_hostname }}_{{ cdb }}_{{ ansible_date_time.date }}.log"
+        flat: true
+      when: rp_lines | length > 0
+
+    - name: "POST | Traer resumen consolidado a maquina local"
+      ansible.builtin.fetch:
+        src:  "{{ resumen_file }}"
+        dest: "/ansible_restore_point/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
+        flat: true
+      run_once: true
