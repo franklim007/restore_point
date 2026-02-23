@@ -145,27 +145,15 @@
         sqlplus -s "{{ oracle_user }}" << 'EOF'
         SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
         ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
-        SELECT
-            CASE
-              WHEN rp.con_id = 1 THEN 'CDB$ROOT'
-              WHEN rp.con_id = 2 THEN 'PDB$SEED'
-              ELSE NVL(p.name, 'UNKNOWN')
-            END                                       || '|' ||
-            CASE
-              WHEN rp.con_id = 1 THEN 'CDB'
-              ELSE 'PDB'
-            END                                       || '|' ||
-            rp.name                                   || '|' ||
-            rp.guarantee_flashback_database           || '|' ||
-            TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS') || '|' ||
-            ROUND((SYSDATE - rp.time), 2)             || '|' ||
-            NVL(rp.storage_size, 0)                  || '|' ||
-            rp.scn                                   || '|' ||
-            NVL(rp.pdb_restore_point, 'NO')          || '|' ||
-            NVL(rp.clean_pdb_restore_point, 'NO')
-        FROM cdb_restore_points rp
-        LEFT JOIN v$pdbs p ON rp.con_id = p.con_id
-        ORDER BY rp.con_id, rp.time DESC;
+SELECT
+    rp.name                                         || '|' ||
+    rp.guarantee_flashback_database                 || '|' ||
+    TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')       || '|' ||
+    ROUND((SYSDATE - rp.time), 2)                  || '|' ||
+    NVL(rp.storage_size, 0)                        || '|' ||
+    rp.scn
+FROM v$restore_point rp
+ORDER BY rp.time DESC;
         EXIT;
         EOF
       register: r_restore_points
@@ -175,59 +163,23 @@
       loop: "{{ oracle_databases }}"
       loop_control:
         label: "{{ item.oracle_sid }}"
-- name: "2 | Escribir en resumen solo CDBs/PDBs con restore points"
+  - name: "2 | Separar CDB y PDB restore points"
+      ansible.builtin.set_fact:
+        rp_list: "{{ r_restore_points.stdout_lines | select('match', '.+\|.+') | list }}"
+
+    - name: "3 | Escribir en resumen solo si hay restore points"
       ansible.builtin.blockinfile:
-        path: "{{ resumen_file }}"
-        marker: "# {mark} {{ inventory_hostname }}_{{ item.item.oracle_sid }}"
+        ...
         block: |
-
-          Host         : {{ inventory_hostname }}
-          CDB          : {{ item.item.oracle_sid }}
-          BD Info      : {{ (r_db_info.results[idx].stdout | trim).split('|')[0] }} ({{ (r_db_info.results[idx].stdout | trim).split('|')[1] }})
-          Versión      : {{ (r_db_info.results[idx].stdout | trim).split('|')[3] }}
-          ──────────────────────────────────────────────────────────────────────────────
-          {% set rp_list = item.stdout_lines | select('match', '.+\|.+') | list %}
-          {% set cdb_rps = rp_list | select('match', '^[^|]+\|CDB\|.*') | list %}
-          {% set pdb_rps = rp_list | select('match', '^[^|]+\|PDB\|.*') | list %}
-
-          {% if cdb_rps | length > 0 %}
-          [CDB - Restore Points]
-          {% for line in cdb_rps %}
+          {% for line in rp_list %}
           {% set c = line.split('|') %}
-            · Contenedor : {{ c[0] }}
-              Nombre     : {{ c[2] }}
-              Creado     : {{ c[4] }}
-              Antigüedad : {{ c[5] | float | round(1) }} días
-              SCN        : {{ c[7] }}
-              Guaranteed : {{ c[3] }}
-              Storage    : {{ (c[6] | int / 1073741824) | round(2) }} GB
+            · Nombre     : {{ c[0] }}
+              Guaranteed : {{ c[1] }}
+              Creado     : {{ c[2] }}
+              Antigüedad : {{ c[3] | float | round(1) }} días
+              Storage    : {{ (c[4] | int / 1073741824) | round(2) }} GB
+              SCN        : {{ c[5] }}
           {% endfor %}
-          {% endif %}
-
-          {% if pdb_rps | length > 0 %}
-          [PDB - Restore Points]
-          {% for line in pdb_rps %}
-          {% set c = line.split('|') %}
-            · PDB        : {{ c[0] }}
-              Nombre     : {{ c[2] }}
-              Creado     : {{ c[4] }}
-              Antigüedad : {{ c[5] | float | round(1) }} días
-              SCN        : {{ c[7] }}
-              Guaranteed : {{ c[3] }}
-              Storage    : {{ (c[6] | int / 1073741824) | round(2) }} GB
-              Es PDB RP  : {{ c[8] }}
-              Clean PDB  : {{ c[9] }}
-          {% endfor %}
-          {% endif %}
-        insertafter: EOF
-        mode: '0644'
-      delegate_to: localhost
-      loop: "{{ r_restore_points.results }}"
-      loop_control:
-        index_var: idx
-        label: "{{ item.item.oracle_sid }}"
-      when: item.stdout_lines | select('match', '.+\|.+') | list | length > 0
-```
 
 El resumen resultante quedará así:
 ```
@@ -259,4 +211,166 @@ Versión      : 19.0.0.0.0
     Guaranteed : NO
     Storage    : 0.12 GB
     Es PDB RP  : YES
-    Clean PDB  : NO
+    Clean PDB  : NO********************
+
+
+
+**************************************************
+---
+- name: "Oracle - Resumen BDs con Restore Points Activos"
+  hosts: "{{ target_host | default('oracle_single_instance') }}"
+  gather_facts: true
+  serial: 5
+  vars:
+    oracle_user:    "/ as sysdba"
+    oracle_os_user: "oracle"
+    local_out_dir:  "/ansible_restore_point"
+    resumen_file:   "{{ local_out_dir }}/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
+
+  pre_tasks:
+
+    - name: "PRE | Crear directorio local en controller"
+      ansible.builtin.file:
+        path: "{{ local_out_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+
+    - name: "PRE | Inicializar fichero de resumen (solo primera vez)"
+      ansible.builtin.copy:
+        dest: "{{ resumen_file }}"
+        content: |
+          ================================================================================
+           RESTORE POINTS ACTIVOS - {{ ansible_date_time.date }}
+          ================================================================================
+        force: false
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+
+  tasks:
+
+    - name: "1 | Obtener ORACLE_HOME desde fichero env"
+      ansible.builtin.shell: |
+        source /home/oracle/{{ cdb }}.env
+        echo $ORACLE_HOME
+      register: r_oracle_home
+      changed_when: false
+      become: true
+      become_user: "{{ oracle_os_user }}"
+      args:
+        executable: /bin/bash
+
+    - name: "1 | Guardar ORACLE_HOME como variable"
+      ansible.builtin.set_fact:
+        oracle_home: "{{ r_oracle_home.stdout | trim }}"
+
+    - name: "1 | Consultar restore points CDB y PDBs"
+      ansible.builtin.shell: |
+        source /home/oracle/{{ cdb }}.env
+        sqlplus -s "{{ oracle_user }}" << 'EOF'
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
+        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        SELECT
+            con$name                                    || '|' ||
+            name                                        || '|' ||
+            guarantee_flashback_database                || '|' ||
+            TO_CHAR(time,'DD/MM/YYYY HH24:MI:SS')      || '|' ||
+            ROUND((SYSDATE - time), 2)                 || '|' ||
+            NVL(storage_size, 0)                       || '|' ||
+            scn
+        FROM containers(v$restore_point)
+        ORDER BY con$name, time DESC;
+        EXIT;
+        EOF
+      register: r_restore_points
+      changed_when: false
+      become: true
+      become_user: "{{ oracle_os_user }}"
+      args:
+        executable: /bin/bash
+
+    - name: "2 | Parsear restore points"
+      ansible.builtin.set_fact:
+        rp_list: "{{ r_restore_points.stdout_lines | select('match', '.+\|.+') | list }}"
+
+    - name: "3 | Escribir resultado en resumen"
+      ansible.builtin.blockinfile:
+        path: "{{ resumen_file }}"
+        marker: "# {mark} {{ inventory_hostname }}_{{ cdb }}"
+        block: |
+
+          ┌──────────────────────────────────────────────────────────────────────────────
+          │ Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
+          ├──────────────────────────────────────────────────────────────────────────────
+          {% if rp_list | length == 0 %}
+          │ No existen restore points activos
+          {% else %}
+          │ Total restore points: {{ rp_list | length }}
+          │
+          {% for line in rp_list %}
+          {% set c = line.split('|') %}
+          │  · Contenedor : {{ c[0] }}
+          │    Nombre     : {{ c[1] }}
+          │    Guaranteed : {{ c[2] }}
+          │    Creado     : {{ c[3] }}
+          │    Antigüedad : {{ c[4] | float | round(1) }} días
+          │    Storage    : {{ (c[5] | int / 1073741824) | round(2) }} GB
+          │    SCN        : {{ c[6] }}
+          │
+          {% endfor %}
+          {% endif %}
+          └──────────────────────────────────────────────────────────────────────────────
+        insertafter: EOF
+        mode: '0644'
+      delegate_to: localhost
+
+  post_tasks:
+
+    - name: "POST | Pie del resumen"
+      ansible.builtin.lineinfile:
+        path: "{{ resumen_file }}"
+        line: |
+
+          ================================================================================
+           FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
+          ================================================================================
+        insertafter: EOF
+      delegate_to: localhost
+      run_once: true
+```
+
+La salida del fichero quedará así:
+```
+================================================================================
+ RESTORE POINTS ACTIVOS - 2026-02-23
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────────
+│ Host : oradb01  |  CDB : CDB1
+├──────────────────────────────────────────────────────────────────────────────
+│ Total restore points: 2
+│
+│  · Contenedor : CDB$ROOT
+│    Nombre     : RP_BEFORE_PATCH
+│    Guaranteed : YES
+│    Creado     : 16/02/2026 10:00:00
+│    Antigüedad : 7.0 días
+│    Storage    : 0.50 GB
+│    SCN        : 12345678
+│
+│  · Contenedor : PDB_VENTAS
+│    Nombre     : RP_PDB_VENTAS
+│    Guaranteed : NO
+│    Creado     : 18/02/2026 08:00:00
+│    Antigüedad : 5.0 días
+│    Storage    : 0.12 GB
+│    SCN        : 12349999
+│
+└──────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────────────────────────────────────────────────────────
+│ Host : oradb02  |  CDB : CDB2
+├──────────────────────────────────────────────────────────────────────────────
+│ No existen restore points activos
