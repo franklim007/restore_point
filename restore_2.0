@@ -8,7 +8,7 @@
     oracle_user:    "/ as sysdba"
     env_file:       "/home/oracle/{{ cdb }}.env"
     local_out_dir:  "/ansible_restore_point"
-    log_file:       "{{ local_out_dir }}/{{ inventory_hostname }}_{{ cdb }}_{{ ansible_date_time.date }}.log"
+    log_file:       "{{ local_out_dir }}/{{ inventory_hostname }}_{{ cdb }}_{{ ansible_date_time.date }}.txt"
     resumen_file:   "{{ local_out_dir }}/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
 
   pre_tasks:
@@ -35,53 +35,27 @@
 
   tasks:
 
-    - name: "1 | Consultar restore points en CDB y todas sus PDBs"
+    - name: "1 | Consultar restore points CDB y PDBs"
       ansible.builtin.shell: |
         source {{ env_file }}
         sqlplus -s "{{ oracle_user }}" << 'EOF'
         SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
-        SET SERVEROUTPUT ON SIZE UNLIMITED
         ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
-
-        -- CDB$ROOT
         SELECT
-            'CDB$ROOT'                                  || '|' ||
+            CASE
+                WHEN rp.con_id = 0 THEN 'CDB$ROOT'
+                WHEN rp.con_id = 1 THEN 'CDB$ROOT'
+                ELSE NVL(p.name, 'UNKNOWN')
+            END                                         || '|' ||
             rp.name                                     || '|' ||
             rp.guarantee_flashback_database             || '|' ||
             TO_CHAR(rp.time,'DD/MM/YYYY HH24:MI:SS')   || '|' ||
             ROUND((SYSDATE - rp.time), 2)              || '|' ||
             NVL(rp.storage_size, 0)                    || '|' ||
             rp.scn
-        FROM v\$restore_point rp;
-
-        -- PDBs
-        DECLARE
-            CURSOR c_pdbs IS
-                SELECT name FROM v\$pdbs
-                WHERE name NOT IN ('PDB\$SEED')
-                AND open_mode = 'READ WRITE';
-        BEGIN
-            FOR r_pdb IN c_pdbs LOOP
-                EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER=' || r_pdb.name;
-                FOR r_rp IN (
-                    SELECT name, guarantee_flashback_database,
-                           time, storage_size, scn
-                    FROM v\$restore_point
-                ) LOOP
-                    DBMS_OUTPUT.PUT_LINE(
-                        r_pdb.name                                  || '|' ||
-                        r_rp.name                                   || '|' ||
-                        r_rp.guarantee_flashback_database           || '|' ||
-                        TO_CHAR(r_rp.time,'DD/MM/YYYY HH24:MI:SS') || '|' ||
-                        ROUND((SYSDATE - r_rp.time), 2)            || '|' ||
-                        NVL(r_rp.storage_size, 0)                  || '|' ||
-                        r_rp.scn
-                    );
-                END LOOP;
-                EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER=CDB\$ROOT';
-            END LOOP;
-        END;
-        /
+        FROM v\$restore_point rp
+        LEFT JOIN v\$pdbs p ON rp.con_id = p.con_id
+        ORDER BY rp.con_id, rp.time DESC;
         EXIT;
         EOF
       register: r_restore_points
@@ -101,13 +75,17 @@
         mode: '0644'
         content: |
           ================================================================================
-           Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
-           Fecha: {{ ansible_date_time.iso8601 }}
+           Host  : {{ inventory_hostname }}
+           CDB   : {{ cdb }}
+           Fecha : {{ ansible_date_time.iso8601 }}
           ================================================================================
           {% if rp_list | length == 0 %}
-          Sin restore points activos.
+
+           Sin restore points activos.
+
           {% else %}
-          Total restore points encontrados: {{ rp_list | length }}
+
+           Total restore points encontrados: {{ rp_list | length }}
           ──────────────────────────────────────────────────────────────────────────────
           {% for line in rp_list %}
           {% set c = line.split('|') %}
@@ -118,6 +96,7 @@
               Antigüedad : {{ c[4] | float | round(1) }} días
               Storage    : {{ (c[5] | int / 1073741824) | round(2) }} GB
               SCN        : {{ c[6] }}
+
           {% endfor %}
           {% endif %}
           ================================================================================
@@ -130,7 +109,8 @@
         block: |
 
           ┌──────────────────────────────────────────────────────────────────────────────
-          │ Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
+          │ Host  : {{ inventory_hostname }}
+          │ CDB   : {{ cdb }}
           ├──────────────────────────────────────────────────────────────────────────────
           {% for line in rp_list %}
           {% set c = line.split('|') %}
@@ -166,23 +146,12 @@
 
 ---
 
-## Resultado en `/ansible_restore_point/`
+## Ficheros que genera en `/ansible_restore_point/`
 ```
-# Log individual por cada CDB (todas, tengan o no restore points)
-oradb01_CDB1_2026-02-23.log
-oradb02_CDB2_2026-02-23.log
-oradb03_CDB3_2026-02-23.log
+# Un log por cada CDB (todas, tengan o no restore points)
+oradb01_CDB1_2026-02-23.txt    ← con detalle o "Sin restore points activos"
+oradb02_CDB2_2026-02-23.txt
+oradb03_CDB3_2026-02-23.txt
 
 # Resumen consolidado (solo las que tienen restore points)
 RESUMEN_CON_RP_2026-02-23.txt
-```
-
----
-
-## Flujo resumido
-```
-Por cada host/CDB
-    ├── Consulta CDB$ROOT  → v$restore_point
-    ├── Consulta cada PDB  → ALTER SESSION SET CONTAINER + v$restore_point
-    ├── Guarda log individual (todas)
-    └── Si tiene restore points → añade al resumen consolidado
