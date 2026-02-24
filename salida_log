@@ -1,0 +1,71 @@
+- name: Buscar ficheros descargados
+      delegate_to: localhost
+      become: no
+      run_once: true
+      find:
+        paths: "{{ local_output_dir }}"
+        patterns: "restore_points_*.txt"
+      register: result_files
+
+    - name: Construir resumen global
+      delegate_to: localhost
+      become: no
+      run_once: true
+      shell: |
+        SUMMARY="{{ local_summary_file }}"
+        DIR="{{ local_output_dir }}"
+        TOTAL=0
+        FECHA=$(date '+%Y-%m-%dT%H:%M:%S')
+
+        # Cabecera
+        cat > "$SUMMARY" << 'HEADER'
+        ============================================================
+        RESUMEN GLOBAL DE RESTORE POINTS ACTIVOS
+        HEADER
+        echo "Generado : $FECHA" >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+        echo "" >> "$SUMMARY"
+
+        # Buscar ficheros con restore points activos
+        for FILE in "$DIR"/restore_points_*.txt; do
+          if grep -q "Nombre  :" "$FILE"; then
+            TOTAL=$((TOTAL + 1))
+          fi
+        done
+
+        if [ "$TOTAL" -eq 0 ]; then
+          echo ">>> No existen restore points activos en ninguna base de datos <<<" >> "$SUMMARY"
+        else
+          echo ">>> Hay $TOTAL base(s) de datos con restore points activos <<<" >> "$SUMMARY"
+          echo "============================================================" >> "$SUMMARY"
+          echo "" >> "$SUMMARY"
+          for FILE in "$DIR"/restore_points_*.txt; do
+            if grep -q "Nombre  :" "$FILE"; then
+              cat "$FILE" >> "$SUMMARY"
+              echo "" >> "$SUMMARY"
+            fi
+          done
+        fi
+
+        echo "" >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+        echo "FIN DEL RESUMEN" >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+      register: resumen_result
+      changed_when: false
+
+    - name: Mostrar resumen por pantalla
+      delegate_to: localhost
+      become: no
+      run_once: true
+      debug:
+        msg: "{{ lookup('file', local_summary_file).splitlines() }}"
+
+    - name: Indicar ubicación de ficheros
+      delegate_to: localhost
+      become: no
+      run_once: true
+      debug:
+        msg:
+          - "Ficheros individuales : {{ local_output_dir }}/restore_points_<host>_<cdb>.txt"
+          - "Resumen global        : {{ local_summary_file }}"
