@@ -69,3 +69,36 @@
         msg:
           - "Ficheros individuales : {{ local_output_dir }}/restore_points_<host>_<cdb>.txt"
           - "Resumen global        : {{ local_summary_file }}"
+=================================================
+============================================================
+ RESUMEN GLOBAL DE RESTORE POINTS ACTIVOS
+ HEADER
+ echo "Generado : $FECHA" >> "$SUMMARY"
+ echo "============================================================" >> "$SUMMARY"
+ echo "" >> "$SUMMARY"
+
+ # Buscar ficheros con restore points activos
+ for FILE in "$DIR"/restore_points_*.txt; do
+ if grep -q "Nombre  :" "$FILE"; then
+ TOTAL=$((TOTAL + 1))
+ fi
+ done
+
+ if [ "$TOTAL" -eq 0 ]; then
+ echo ">>> No existen restore points activos en ninguna base de datos <<<" >> "$SUMMARY"
+ else
+ echo ">>> Hay $TOTAL base(s) de datos con restore points activos <<<" >> "$SUMMARY"
+ echo "============================================================" >> "$SUMMARY"
+ echo "" >> "$SUMMARY"
+ for FILE in "$DIR"/restore_points_*.txt; do
+ if grep -q "Nombre  :" "$FILE"; then
+ cat "$FILE" >> "$SUMMARY"
+ echo "" >> "$SUMMARY"
+ fi
+ done
+ fi
+
+ echo "" >> "$SUMMARY"
+ echo "============================================================" >> "$SUMMARY"
+ echo "FIN DEL RESUMEN" >> "$SUMMARY"
+ echo "============================================================" >> "$SUMMARY"
