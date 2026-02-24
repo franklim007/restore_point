@@ -114,3 +114,338 @@
         echo "FIN DEL RESUMEN"                 >> "$SUMMARY"
         echo "============================================================" >> "$SUMMARY"
       changed_when: false
+===============================================================================================================================
+NO MULTITENANT
+===============================================================================================================================
+---
+- name: Consultar Restore Points Oracle 19c CDB y Single Instance
+  hosts: oracle_servers
+  become: yes
+  become_user: "{{ oracle_os_user }}"
+  gather_facts: yes
+  vars_files:
+    - vault/secrets.yml
+
+  vars:
+    local_output_dir: /tmp/oracle_restore_points
+    local_summary_file: /tmp/oracle_restore_points/resumen_global.txt
+
+  tasks:
+
+    # -------------------------------------------------------
+    # Cargar ORACLE_HOME desde cdb.env
+    # -------------------------------------------------------
+    - name: Cargar ORACLE_HOME desde cdb.env
+      shell: |
+        source /home/oracle/{{ cdb }}.env
+        echo $ORACLE_HOME
+      register: home_cdb
+      changed_when: false
+      failed_when: home_cdb.stdout == ''
+
+    - name: Debug ORACLE_HOME cargado
+      debug:
+        msg: "ORACLE_HOME para {{ cdb }} en {{ inventory_hostname }}: {{ home_cdb.stdout }}"
+
+    # -------------------------------------------------------
+    # Verificar arquitectura CDB o Single
+    # -------------------------------------------------------
+    - name: Comprobar si la instancia es CDB
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        SELECT cdb FROM v\$database;
+        EXIT;
+        EOF
+      register: is_cdb
+      changed_when: false
+
+    - name: Establecer si es CDB
+      set_fact:
+        is_multitenant: "{{ 'YES' in is_cdb.stdout }}"
+
+    - name: Mostrar tipo de arquitectura
+      debug:
+        msg: |
+          Servidor     : {{ inventory_hostname }}
+          SID          : {{ oracle_sid }}
+          CDB          : {{ cdb }}
+          Arquitectura : {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB (Single Instance)' }}
+
+    # -------------------------------------------------------
+    # BLOQUE CDB — Obtener PDBs (solo si es multitenant)
+    # -------------------------------------------------------
+    - name: Obtener lista de PDBs
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        SELECT name || '|' || con_id || '|' || open_mode FROM v\$pdbs ORDER BY con_id;
+        EXIT;
+        EOF
+      register: pdbs_list
+      when: is_multitenant
+      changed_when: false
+
+    - name: Parsear información de PDBs
+      set_fact:
+        pdbs: "{{ pdbs | default([]) +
+                  [ {
+                    'name':      item.split('|')[0] | trim,
+                    'con_id':    item.split('|')[1] | trim,
+                    'open_mode': item.split('|')[2] | trim
+                  } ]
+               }}"
+      with_items: "{{ pdbs_list.stdout_lines }}"
+      when:
+        - is_multitenant
+        - pdbs_list is defined
+        - item | length > 0
+
+    - name: Mostrar PDBs encontradas
+      debug:
+        msg: |
+          PDBs encontradas en {{ inventory_hostname }}:
+          {% for pdb in pdbs | default([]) %}
+          - {{ pdb.name }} (CON_ID: {{ pdb.con_id }}) - Estado: {{ pdb.open_mode }}
+          {% endfor %}
+      when: is_multitenant
+
+    # -------------------------------------------------------
+    # BLOQUE CDB — Restore points CDB + PDBs
+    # -------------------------------------------------------
+    - name: Consultar restore points en CDB y PDBs
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+
+        SELECT
+          'RP|' ||
+          '{{ inventory_hostname }}'                    || '|' ||
+          d.NAME                                        || '|' ||
+          'CDB'                                         || '|' ||
+          rp.NAME                                       || '|' ||
+          TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
+        FROM V\$RESTORE_POINT rp
+        CROSS JOIN V\$DATABASE d
+        WHERE rp.CON_ID IN (0, 1);
+
+        SELECT
+          'RP|' ||
+          '{{ inventory_hostname }}'                    || '|' ||
+          d.NAME                                        || '|' ||
+          p.NAME                                        || '|' ||
+          rp.NAME                                       || '|' ||
+          TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
+        FROM V\$RESTORE_POINT rp
+        JOIN V\$PDBS p         ON rp.CON_ID = p.CON_ID
+        CROSS JOIN V\$DATABASE d
+        WHERE rp.CON_ID > 1;
+
+        EXIT;
+        EOF
+      register: all_rp
+      when: is_multitenant
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------
+    # BLOQUE SINGLE — Restore points Single Instance
+    # -------------------------------------------------------
+    - name: Consultar restore points en Single Instance
+      shell: |
+        export ORACLE_HOME={{ home_cdb.stdout }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        export ORACLE_SID={{ oracle_sid }}
+        sqlplus -s / as sysdba << EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+
+        SELECT
+          'RP|' ||
+          '{{ inventory_hostname }}'                    || '|' ||
+          d.NAME                                        || '|' ||
+          'SINGLE'                                      || '|' ||
+          rp.NAME                                       || '|' ||
+          TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
+        FROM V\$RESTORE_POINT rp
+        CROSS JOIN V\$DATABASE d;
+
+        EXIT;
+        EOF
+      register: single_rp
+      when: not is_multitenant
+      changed_when: false
+      failed_when: false
+
+    # -------------------------------------------------------
+    # Consolidar resultado según arquitectura
+    # -------------------------------------------------------
+    - name: Filtrar líneas RP en CDB
+      set_fact:
+        all_rp_lines: "{{ all_rp.stdout_lines | select('match', '^RP\\|') | list }}"
+      when: is_multitenant
+
+    - name: Filtrar líneas RP en Single
+      set_fact:
+        all_rp_lines: "{{ single_rp.stdout_lines | select('match', '^RP\\|') | list }}"
+      when: not is_multitenant
+
+    - name: Parsear restore points encontrados
+      set_fact:
+        restore_points: "{{ restore_points | default([]) +
+                            [ {
+                              'maquina': item.split('|')[1] | trim,
+                              'bd':      item.split('|')[2] | trim,
+                              'pdb':     item.split('|')[3] | trim,
+                              'nombre':  item.split('|')[4] | trim,
+                              'fecha':   item.split('|')[5] | trim
+                            } ]
+                         }}"
+      with_items: "{{ all_rp_lines }}"
+      when: all_rp_lines | length > 0
+
+    - name: Mostrar restore points encontrados
+      debug:
+        msg: |
+          Restore points en {{ inventory_hostname }} / {{ cdb }}:
+          {% if restore_points | default([]) | length == 0 %}
+          No hay restore points activos.
+          {% else %}
+          {% for rp in restore_points | default([]) %}
+          - Máquina : {{ rp.maquina }}
+            BD      : {{ rp.bd }}
+            Tipo    : {{ rp.pdb }}
+            Nombre  : {{ rp.nombre }}
+            Fecha   : {{ rp.fecha }}
+          {% endfor %}
+          {% endif %}
+
+    # -------------------------------------------------------
+    # Generar fichero TXT en servidor remoto
+    # -------------------------------------------------------
+    - name: Generar fichero TXT en servidor remoto
+      copy:
+        dest: "/tmp/restore_points_{{ inventory_hostname }}_{{ cdb }}.txt"
+        content: |
+          ============================================================
+          RESTORE POINTS  |  {{ inventory_hostname }}  |  BD: {{ cdb }}
+          SID             : {{ oracle_sid }}
+          Arquitectura    : {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB (Single Instance)' }}
+          Fecha consulta  : {{ ansible_date_time.iso8601 }}
+          ============================================================
+          {% if restore_points | default([]) | length == 0 %}
+          HAS_RESTORE_POINTS=NO
+
+          No hay restore points activos en este servidor/BD.
+
+          {% else %}
+          HAS_RESTORE_POINTS=YES
+
+          {% for rp in restore_points | default([]) %}
+          Máquina : {{ rp.maquina }}
+          BD      : {{ rp.bd }}
+          Tipo    : {{ rp.pdb }}
+          Nombre  : {{ rp.nombre }}
+          Fecha   : {{ rp.fecha }}
+          ------------------------------------------------------------
+          {% endfor %}
+          {% endif %}
+          ============================================================
+
+    # -------------------------------------------------------
+    # Traer fichero a la máquina de control
+    # -------------------------------------------------------
+    - name: Crear directorio local en máquina de control
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Fetch fichero al equipo de control
+      fetch:
+        src: "/tmp/restore_points_{{ inventory_hostname }}_{{ cdb }}.txt"
+        dest: "{{ local_output_dir }}/restore_points_{{ inventory_hostname }}_{{ cdb }}.txt"
+        flat: yes
+
+    # -------------------------------------------------------
+    # Resumen global — una vez al final
+    # -------------------------------------------------------
+    - name: Buscar ficheros descargados
+      delegate_to: localhost
+      become: no
+      run_once: true
+      find:
+        paths: "{{ local_output_dir }}"
+        patterns: "restore_points_*.txt"
+      register: result_files
+
+    - name: Construir resumen global
+      delegate_to: localhost
+      become: no
+      run_once: true
+      shell: |
+        SUMMARY="{{ local_summary_file }}"
+        DIR="{{ local_output_dir }}"
+        TOTAL=0
+        FECHA=$(date '+%Y-%m-%dT%H:%M:%S')
+
+        # Contar ficheros con restore points activos
+        for FILE in "$DIR"/restore_points_*.txt; do
+          if grep -q "HAS_RESTORE_POINTS=YES" "$FILE"; then
+            TOTAL=$((TOTAL + 1))
+          fi
+        done
+
+        # Cabecera
+        echo "============================================================" > "$SUMMARY"
+        echo "RESUMEN GLOBAL DE RESTORE POINTS ACTIVOS"                    >> "$SUMMARY"
+        echo "Generado : $FECHA"                                            >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+        echo ""                                                             >> "$SUMMARY"
+
+        # Cuerpo
+        if [ "$TOTAL" -eq 0 ]; then
+          echo ">>> No existen restore points activos en ninguna base de datos <<<" >> "$SUMMARY"
+        else
+          echo ">>> Hay $TOTAL base(s) de datos con restore points activos <<<"     >> "$SUMMARY"
+          echo "============================================================"       >> "$SUMMARY"
+          echo ""                                                                   >> "$SUMMARY"
+          for FILE in "$DIR"/restore_points_*.txt; do
+            if grep -q "HAS_RESTORE_POINTS=YES" "$FILE"; then
+              cat "$FILE" >> "$SUMMARY"
+              echo ""     >> "$SUMMARY"
+            fi
+          done
+        fi
+
+        echo ""                                >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+        echo "FIN DEL RESUMEN"                 >> "$SUMMARY"
+        echo "============================================================" >> "$SUMMARY"
+      changed_when: false
+
+    - name: Mostrar resumen por pantalla
+      delegate_to: localhost
+      become: no
+      run_once: true
+      debug:
+        msg: "{{ lookup('file', local_summary_file).splitlines() }}"
+
+    - name: Indicar ubicación de ficheros
+      delegate_to: localhost
+      become: no
+      run_once: true
+      debug:
+        msg:
+          - "Ficheros individuales : {{ local_output_dir }}/restore_points_<host>_<cdb>.txt"
+          - "Resumen global        : {{ local_summary_file }}"
