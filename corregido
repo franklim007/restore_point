@@ -1,317 +1,218 @@
 ---
-- name: Monitorizacion Restore Points Oracle
-  hosts: all
+# ================================================================
+# PLAY 1: Ejecutar consulta en servidores Oracle y traer resultado
+# ================================================================
+- name: Consultar Restore Points Oracle 19c Multitenant
+  hosts: oracle_servers
+  become: yes
+  become_user: "{{ oracle_os_user }}"
   gather_facts: yes
-  vars:
-    reports_dir:   "/tmp/ansible/"
-    reports_salida: "/tmp/ansible/salida/"
-  vars_files:
-    - vars_multi.yml
-
-  pre_tasks:
-
-    - name: "PRE | Definir variables de ficheros"
-      ansible.builtin.set_fact:
-        log_file: "{{ reports_salida }}restore_points_{{ inventory_hostname }}_{{ ansible_date_time.date }}.log"
-
-    - name: "PRE | Crear directorio reports_dir"
-      ansible.builtin.file:
-        path: "{{ reports_dir }}"
-        state: directory
-        mode: '0755'
-
-    - name: "PRE | Crear directorio reports_salida"
-      ansible.builtin.file:
-        path: "{{ reports_salida }}"
-        state: directory
-        mode: '0755'
 
   tasks:
 
-    # =========================================
-    # VARIABLES ORACLE
-    # =========================================
-    - name: "1 | Sacar ORACLE_HOME"
-      ansible.builtin.shell: |
-        cat /home/oracle/{{ cdb }}.env | grep -w "ORACLE_HOME" | cut -d';' -f1 | cut -d'=' -f2
-      register: home_cdb
-      changed_when: false
-      tags: always
-
-    - name: "1 | Sacar ORACLE_UNQNAME"
-      ansible.builtin.shell: |
-        cat /home/oracle/{{ cdb }}.env | grep -w "ORACLE_UNQNAME" | cut -d';' -f1 | cut -d'=' -f2
-      register: cdb_unqname
-      changed_when: false
-      tags: always
-
-    # =========================================
-    # ARQUITECTURA CDB / NON-CDB
-    # =========================================
-    - name: "2 | Comprobar si es CDB"
-      ansible.builtin.shell: |
-        export ORACLE_HOME={{ home_cdb.stdout }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        export ORACLE_SID={{ oracle_sid }}
-        sqlplus -s / as sysdba << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
-        SELECT cdb FROM v$database;
-        EXIT;
-        EOF
-      register: is_cdb
+    - name: Obtener instancias Oracle activas desde oratab
+      shell: grep -v '^#' /etc/oratab | grep -v '^$' | awk -F: '$1 != "*" {print $1}'
+      register: oracle_instances_raw
       changed_when: false
 
-    - name: "2 | Establecer si es multitenant"
-      ansible.builtin.set_fact:
-        is_multitenant: "{{ 'YES' in is_cdb.stdout }}"
+    - name: Registrar lista de instancias
+      set_fact:
+        oracle_instances: "{{ oracle_instances_raw.stdout_lines | select('ne', '') | list }}"
 
-    - name: "2 | Mostrar arquitectura"
-      ansible.builtin.debug:
-        msg: |
-          Servidor    : {{ inventory_hostname }}
-          Arquitectura: {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB (Single Instance)' }}
+    - name: Consultar restore points por cada instancia
+      shell: |
+        export ORACLE_SID="{{ item }}"
+        export ORACLE_HOME="{{ oracle_home }}"
+        export PATH="{{ oracle_home }}/bin:$PATH"
+        export LD_LIBRARY_PATH="{{ oracle_home }}/lib"
 
-    # =========================================
-    # OBTENER PDBs
-    # =========================================
-    - name: "3 | Obtener lista de PDBs"
-      ansible.builtin.shell: |
-        export ORACLE_HOME={{ home_cdb.stdout }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        export ORACLE_SID={{ oracle_sid }}
-        sqlplus -s / as sysdba << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
-        SELECT name || '|' || con_id || '|' || open_mode FROM v$pdbs ORDER BY con_id;
-        EXIT;
-        EOF
-      register: pdbs_list
-      changed_when: false
-      when: is_multitenant
+        sqlplus -s / as sysdba << 'ENDSQL'
+        SET LINESIZE 300
+        SET PAGESIZE 0
+        SET FEEDBACK OFF
+        SET HEADING OFF
+        SET TRIMOUT ON
+        SET TRIMSPOOL ON
+        SET NEWPAGE NONE
 
-    - name: "3 | Inicializar lista PDBs"
-      ansible.builtin.set_fact:
-        pdbs: []
-      when: is_multitenant
-
-    - name: "3 | Parsear PDBs"
-      ansible.builtin.set_fact:
-        pdbs: "{{ pdbs + [ {
-                    'name':      item.split('|')[0],
-                    'con_id':    item.split('|')[1],
-                    'open_mode': item.split('|')[2]
-                  } ] }}"
-      with_items: "{{ pdbs_list.stdout_lines }}"
-      when:
-        - is_multitenant
-        - pdbs_list is defined
-        - item | length > 0
-
-    - name: "3 | Mostrar PDBs encontradas"
-      ansible.builtin.debug:
-        msg: |
-          PDBs encontradas en {{ inventory_hostname }}:
-          {% for pdb in pdbs | default([]) %}
-          - {{ pdb.name }} (CON_ID: {{ pdb.con_id }}) - Estado: {{ pdb.open_mode }}
-          {% endfor %}
-      when: is_multitenant
-
-    # =========================================
-    # CABECERA LOG
-    # =========================================
-    - name: "4 | Escribir cabecera del log"
-      ansible.builtin.copy:
-        dest: "{{ log_file }}"
-        mode: '0644'
-        content: |
-          ============================================================
-          CONSULTA RESTORE POINTS ORACLE
-          ============================================================
-          Host         : {{ inventory_hostname }}
-          IP           : {{ ansible_default_ipv4.address | default('N/A') }}
-          SID          : {{ oracle_sid }}
-          CDB          : {{ cdb }}
-          Arquitectura : {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB' }}
-          Fecha/Hora   : {{ ansible_date_time.iso8601 }}
-          ============================================================
-
-    # =========================================
-    # CONSULTA RESTORE POINTS
-    # =========================================
-    - name: "5 | Consultar restore points"
-      ansible.builtin.shell: |
-        export ORACLE_HOME={{ home_cdb.stdout }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        export ORACLE_SID={{ oracle_sid }}
-        sqlplus -s / as sysdba << 'EOF'
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINESIZE 300
-        ALTER SESSION SET NLS_DATE_FORMAT='DD/MM/YYYY HH24:MI:SS';
+        -- Restore points en CDB (CON_ID=0 o 1)
         SELECT
-            CASE
-                WHEN rp.con_id = 0 THEN 'CDB$ROOT'
-                WHEN rp.con_id = 1 THEN 'CDB$ROOT'
-                ELSE NVL(p.name, 'UNKNOWN')
-            END                                           || '|' ||
-            rp.name                                       || '|' ||
-            rp.guarantee_flashback_database               || '|' ||
-            TO_CHAR(rp.time, 'DD/MM/YYYY HH24:MI:SS')    || '|' ||
-            TO_CHAR(ROUND((SYSDATE - rp.time), 2))        || '|' ||
-            TO_CHAR(NVL(rp.storage_size, 0))              || '|' ||
-            TO_CHAR(rp.scn)
-        FROM v$restore_point rp
-        LEFT JOIN v$pdbs p ON rp.con_id = p.con_id
-        ORDER BY rp.con_id, rp.time DESC;
+          'RESTORE_POINT|' ||
+          '{{ inventory_hostname }}' || '|' ||
+          d.NAME                     || '|' ||
+          'CDB'                      || '|' ||
+          rp.NAME                    || '|' ||
+          TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
+        FROM V$RESTORE_POINT rp
+        CROSS JOIN V$DATABASE d
+        WHERE rp.CON_ID IN (0, 1);
+
+        -- Restore points en PDBs (CON_ID > 1)
+        SELECT
+          'RESTORE_POINT|' ||
+          '{{ inventory_hostname }}' || '|' ||
+          d.NAME                     || '|' ||
+          p.NAME                     || '|' ||
+          rp.NAME                    || '|' ||
+          TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
+        FROM V$RESTORE_POINT rp
+        JOIN V$PDBS p        ON rp.CON_ID = p.CON_ID
+        CROSS JOIN V$DATABASE d
+        WHERE rp.CON_ID > 1;
+
         EXIT;
-        EOF
-      register: rp_output
+        ENDSQL
+      loop: "{{ oracle_instances }}"
+      register: sql_output
       changed_when: false
+      failed_when: false
 
-    - name: "5 | Parsear lineas validas"
-      ansible.builtin.set_fact:
-        rp_lines: >-
-          {{ rp_output.stdout_lines
-             | select('match', '^[^|]+\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|[^|]+\|[^|]+$')
-             | map('trim')
-             | list }}
+    - name: Crear directorio local en máquina de control
+      delegate_to: localhost
+      become: no
+      file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: '0755'
 
-    # =========================================
-    # ESCRIBIR RESULTADO EN LOG
-    # =========================================
-    - name: "6 | Escribir resultado CON restore points"
-      ansible.builtin.blockinfile:
-        path: "{{ log_file }}"
-        marker: "# {mark} RESULTADO CONSULTA"
-        block: |
-          RESULTADO: ⚠️  SE ENCONTRARON {{ rp_lines | length }} RESTORE POINT(S) ACTIVOS
-
-          DETALLE:
-          {% for rp in rp_lines %}
-          {% set c = rp.split('|') %}
-            Contenedor : {{ c[0] | trim }}
-            Nombre     : {{ c[1] | trim }}
-            Guaranteed : {{ c[2] | trim }}
-            Creado     : {{ c[3] | trim }}
-            Antigüedad : {{ c[4] | trim }} días
-            Storage    : {{ (c[5] | trim | int / 1073741824) | round(2) }} GB
-            SCN        : {{ c[6] | trim }}
-            --------------------------------------------------
-          {% endfor %}
-      when: rp_lines | length > 0
-
-    - name: "6 | Escribir resultado SIN restore points"
-      ansible.builtin.blockinfile:
-        path: "{{ log_file }}"
-        marker: "# {mark} RESULTADO CONSULTA"
-        block: |
-          RESULTADO: ✅ No se encontraron Restore Points activos.
-      when: rp_lines | length == 0
-
-    - name: "6 | Escribir errores en log si los hay"
-      ansible.builtin.blockinfile:
-        path: "{{ log_file }}"
-        marker: "# {mark} ERRORES"
-        block: |
-          ⚠️  ERRORES DETECTADOS:
-          {{ rp_output.stderr }}
-      when:
-        - rp_output.stderr is defined
-        - rp_output.stderr != ''
-
-    - name: "6 | Escribir pie del log"
-      ansible.builtin.lineinfile:
-        path: "{{ log_file }}"
-        line: |
-          ============================================================
-          FIN DE CONSULTA - {{ ansible_date_time.iso8601 }}
-          ============================================================
-        insertafter: EOF
-
-    # =========================================
-    # RESUMEN CONSOLIDADO - SOLO CON RP
-    # =========================================
-    - name: "7 | Inicializar fichero resumen (solo primera vez)"
-      ansible.builtin.copy:
-        dest: "{{ reports_salida }}RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
+    - name: Generar fichero de resultado en el servidor remoto
+      copy:
+        dest: "/tmp/restore_points_{{ inventory_hostname }}.txt"
         content: |
+          {% set ns = namespace(found=false) %}
           ============================================================
-          RESUMEN - BASES DE DATOS CON RESTORE POINTS ACTIVOS
-          Fecha: {{ ansible_date_time.date }}
+          RESTORE POINTS - {{ inventory_hostname }}
+          Fecha consulta : {{ ansible_date_time.iso8601 }}
           ============================================================
-        force: false
-        mode: '0644'
-      run_once: true
-
-    - name: "7 | Añadir al resumen solo si tiene restore points"
-      ansible.builtin.blockinfile:
-        path: "{{ reports_salida }}RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
-        marker: "# {mark} {{ inventory_hostname }}_{{ cdb }}"
-        block: |
-
-          ┌──────────────────────────────────────────────────────────
-          │ Host : {{ inventory_hostname }}  |  CDB : {{ cdb }}
-          ├──────────────────────────────────────────────────────────
-          {% for rp in rp_lines %}
-          {% set c = rp.split('|') %}
-          │  Contenedor : {{ c[0] | trim }}
-          │  Nombre     : {{ c[1] | trim }}
-          │  Guaranteed : {{ c[2] | trim }}
-          │  Creado     : {{ c[3] | trim }}
-          │  Antigüedad : {{ c[4] | trim }} días
-          │  Storage    : {{ (c[5] | trim | int / 1073741824) | round(2) }} GB
-          │  SCN        : {{ c[6] | trim }}
-          │
+          {% for result in sql_output.results %}
+          {% for line in result.stdout_lines %}
+          {% if line.startswith('RESTORE_POINT|') %}
+          {% set ns.found = true %}
+          {% set fields = line.split('|') %}
+          Máquina  : {{ fields[1] }}
+          BD (CDB) : {{ fields[2] }}
+          PDB      : {{ fields[3] }}
+          Nombre   : {{ fields[4] }}
+          Fecha    : {{ fields[5] }}
+          ------------------------------------------------------------
+          {% endif %}
           {% endfor %}
-          └──────────────────────────────────────────────────────────
-        insertafter: EOF
-      when: rp_lines | length > 0
+          {% endfor %}
+          {% if not ns.found %}
+          No hay restore points activos en este servidor.
+          {% endif %}
 
-  post_tasks:
+    - name: Traer fichero a la máquina de control
+      fetch:
+        src: "/tmp/restore_points_{{ inventory_hostname }}.txt"
+        dest: "{{ local_output_dir }}/restore_points_{{ inventory_hostname }}.txt"
+        flat: yes
 
-    - name: "POST | Pie del resumen consolidado"
-      ansible.builtin.lineinfile:
-        path: "{{ reports_salida }}RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
-        line: |
+# ================================================================
+# PLAY 2: Generar resumen global en la máquina de control
+# ================================================================
+- name: Generar resumen global en máquina de control
+  hosts: localhost
+  gather_facts: yes
+
+  vars:
+    local_output_dir: /tmp/oracle_restore_points
+    local_summary_file: /tmp/oracle_restore_points/resumen_global.txt
+
+  tasks:
+
+    - name: Buscar ficheros descargados
+      find:
+        paths: "{{ local_output_dir }}"
+        patterns: "restore_points_*.txt"
+      register: result_files
+
+    - name: Leer contenido de cada fichero
+      slurp:
+        src: "{{ item.path }}"
+      loop: "{{ result_files.files }}"
+      register: file_contents
+
+    - name: Generar resumen global
+      copy:
+        dest: "{{ local_summary_file }}"
+        content: |
+          {% set ns = namespace(total_bd=0, bloques=[]) %}
+          {% for file in file_contents.results %}
+          {% set content = file.content | b64decode %}
+          {% if 'Nombre   :' in content %}
+          {% set ns.total_bd = ns.total_bd + 1 %}
+          {% set ns.bloques = ns.bloques + [content] %}
+          {% endif %}
+          {% endfor %}
           ============================================================
-          FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
+          RESUMEN GLOBAL DE RESTORE POINTS ACTIVOS
+          Generado : {{ ansible_date_time.iso8601 }}
           ============================================================
-        insertafter: EOF
-      run_once: true
+
+          {% if ns.total_bd == 0 %}
+          >>> No existen restore points activos en ninguna base de datos <
+          {% else %}
+          Hay {{ ns.total_bd }} servidor(es) con restore points activos:
+          ============================================================
+          {% for bloque in ns.bloques %}
+          {{ bloque }}
+          {% endfor %}
+          {% endif %}
+
+          ============================================================
+          FIN DEL RESUMEN
+          ============================================================
+
+    - name: Mostrar resumen por pantalla
+      debug:
+        msg: "{{ lookup('file', local_summary_file).splitlines() }}"
+
+    - name: Indicar ubicación de ficheros
+      debug:
+        msg:
+          - "Ficheros por servidor : {{ local_output_dir }}/restore_points_<servidor>.txt"
+          - "Resumen global        : {{ local_summary_file }}"
 ```
 
 ---
 
-## Ficheros generados en `/tmp/ansible/salida/`
+## Ejemplo de salida — fichero por servidor
 ```
-# Log individual por cada host (todos)
-restore_points_oradb01_2026-02-23.log
-restore_points_oradb02_2026-02-23.log
+============================================================
+RESTORE POINTS - servidor1
+Fecha consulta : 2026-02-24T10:30:00Z
+============================================================
+Máquina  : servidor1
+BD (CDB) : ORCL
+PDB      : CDB
+Nombre   : RP_ANTES_PARCHE
+Fecha    : 2026-02-20 08:00:00
+------------------------------------------------------------
+Máquina  : servidor1
+BD (CDB) : ORCL
+PDB      : PDB_PRO
+Nombre   : RP_PDB_PRO_FEB
+Fecha    : 2026-02-22 14:15:00
+------------------------------------------------------------
+```
 
-# Resumen consolidado (solo los que tienen restore points)
-RESUMEN_CON_RP_2026-02-23.txt
+## Ejemplo de salida — resumen global con restore points
+```
+============================================================
+RESUMEN GLOBAL DE RESTORE POINTS ACTIVOS
+Generado : 2026-02-24T10:35:00Z
+============================================================
 
+Hay 2 servidor(es) con restore points activos:
+============================================================
+... (detalle de cada servidor) ...
 
-*************************************************************************************************************************************************************************
-post_tasks:
+============================================================
+FIN DEL RESUMEN
+============================================================
+```
 
-    - name: "POST | Pie del resumen consolidado"
-      ansible.builtin.lineinfile:
-        path: "{{ resumen_file }}"
-        line: |
-          ============================================================
-          FIN DEL RESUMEN - {{ ansible_date_time.iso8601 }}
-          ============================================================
-        insertafter: EOF
-      run_once: true
-
-    - name: "POST | Traer log individual solo si tiene restore points"
-      ansible.builtin.fetch:
-        src:  "{{ log_file }}"
-        dest: "/ansible_restore_point/{{ inventory_hostname }}_{{ cdb }}_{{ ansible_date_time.date }}.log"
-        flat: true
-      when: rp_lines | length > 0
-
-    - name: "POST | Traer resumen consolidado a maquina local"
-      ansible.builtin.fetch:
-        src:  "{{ resumen_file }}"
-        dest: "/ansible_restore_point/RESUMEN_CON_RP_{{ ansible_date_time.date }}.txt"
-        flat: true
-      run_once: true
+## Ejemplo de salida — resumen global sin restore points
+```
+>>> No existen restore points activos en ninguna base de datos <
