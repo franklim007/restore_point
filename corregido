@@ -97,86 +97,82 @@
       when: is_multitenant
 
     # -------------------------------------------------------
-    # Consultar restore points en la CDB (conexión local)
+    # Consultar restore points CDB y todas las PDBs de una vez
+    # desde la CDB con / as sysdba — sin necesidad de SCAN
     # -------------------------------------------------------
-    - name: Consultar restore points en CDB
+    - name: Consultar restore points CDB y PDBs
       shell: |
         export ORACLE_HOME={{ home_cdb.stdout }}
         export PATH=$ORACLE_HOME/bin:$PATH
         export ORACLE_SID={{ oracle_sid }}
         sqlplus -s / as sysdba << EOF
         SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+
+        -- Restore points del CDB raiz (CON_ID 0 o 1)
         SELECT
           'RP|' ||
-          '{{ inventory_hostname }}'                      || '|' ||
-          d.NAME                                          || '|' ||
-          'CDB'                                           || '|' ||
-          rp.NAME                                         || '|' ||
+          '{{ inventory_hostname }}'                    || '|' ||
+          d.NAME                                        || '|' ||
+          'CDB'                                         || '|' ||
+          rp.NAME                                       || '|' ||
           TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
         FROM V\$RESTORE_POINT rp
         CROSS JOIN V\$DATABASE d
         WHERE rp.CON_ID IN (0, 1);
-        EXIT;
-        EOF
-      register: cdb_rp
-      changed_when: false
-      failed_when: false
 
-    # -------------------------------------------------------
-    # Consultar restore points en cada PDB (via SCAN)
-    # -------------------------------------------------------
-    - name: Consultar restore points en cada PDB
-      shell: |
-        export ORACLE_HOME={{ home_cdb.stdout }}
-        export PATH=$ORACLE_HOME/bin:$PATH
-        sqlplus -s 'sys/{{ sys_p }}@{{ scan }}:{{ port }}/{{ item.name }}.{{ pdb_domain }} as sysdba' << EOF
-        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF
+        -- Restore points de cada PDB (CON_ID > 1)
         SELECT
           'RP|' ||
-          '{{ inventory_hostname }}'                      || '|' ||
-          (SELECT NAME FROM V\$DATABASE)                  || '|' ||
-          SYS_CONTEXT('USERENV', 'CON_NAME')              || '|' ||
-          rp.NAME                                         || '|' ||
+          '{{ inventory_hostname }}'                    || '|' ||
+          d.NAME                                        || '|' ||
+          p.NAME                                        || '|' ||
+          rp.NAME                                       || '|' ||
           TO_CHAR(rp.TIME, 'YYYY-MM-DD HH24:MI:SS')
-        FROM V\$RESTORE_POINT rp;
+        FROM V\$RESTORE_POINT rp
+        JOIN V\$PDBS p         ON rp.CON_ID = p.CON_ID
+        CROSS JOIN V\$DATABASE d
+        WHERE rp.CON_ID > 1;
+
         EXIT;
         EOF
-      loop: "{{ pdbs | default([]) }}"
-      loop_control:
-        label: "{{ item.name }}"
-      register: pdb_rp
-      when:
-        - is_multitenant
-        - item.name != 'PDB$SEED'
+      register: all_rp
       changed_when: false
       failed_when: false
-      no_log: true
 
     # -------------------------------------------------------
-    # Consolidar todas las líneas RP| encontradas
+    # Parsear líneas RP| del resultado
     # -------------------------------------------------------
-    - name: Consolidar restore points CDB y PDBs
+    - name: Filtrar líneas de restore points
       set_fact:
-        all_rp_lines: >-
-          {{
-            (cdb_rp.stdout_lines | select('match', '^RP\|') | list)
-            +
-            (pdb_rp.results | default([])
-              | selectattr('stdout_lines', 'defined')
-              | map(attribute='stdout_lines') | flatten
-              | select('match', '^RP\|') | list)
-          }}
+        all_rp_lines: "{{ all_rp.stdout_lines | select('match', '^RP\\|') | list }}"
 
-    - name: Mostrar restore points encontrados (debug)
+    - name: Parsear restore points encontrados
+      set_fact:
+        restore_points: "{{ restore_points | default([]) +
+                            [ {
+                              'maquina': item.split('|')[1] | trim,
+                              'bd':      item.split('|')[2] | trim,
+                              'pdb':     item.split('|')[3] | trim,
+                              'nombre':  item.split('|')[4] | trim,
+                              'fecha':   item.split('|')[5] | trim
+                            } ]
+                         }}"
+      with_items: "{{ all_rp_lines }}"
+      when: all_rp_lines | length > 0
+
+    - name: Mostrar restore points encontrados
       debug:
         msg: |
           Restore points en {{ inventory_hostname }} / {{ cdb }}:
-          {% if all_rp_lines | length == 0 %}
+          {% if restore_points | default([]) | length == 0 %}
           No hay restore points activos.
           {% else %}
-          {% for line in all_rp_lines %}
-          {% set f = line.split('|') %}
-          - Máquina: {{ f[1] }} | BD: {{ f[2] }} | PDB: {{ f[3] }} | Nombre: {{ f[4] }} | Fecha: {{ f[5] }}
+          {% for rp in restore_points | default([]) %}
+          - Máquina : {{ rp.maquina }}
+            BD(CDB) : {{ rp.bd }}
+            PDB     : {{ rp.pdb }}
+            Nombre  : {{ rp.nombre }}
+            Fecha   : {{ rp.fecha }}
           {% endfor %}
           {% endif %}
 
@@ -190,23 +186,21 @@
           ============================================================
           RESTORE POINTS  |  {{ inventory_hostname }}  |  CDB: {{ cdb }}
           SID             : {{ oracle_sid }}
-          SCAN            : {{ scan }}
           Arquitectura    : {{ 'Multitenant (CDB/PDB)' if is_multitenant else 'Non-CDB' }}
           Fecha consulta  : {{ ansible_date_time.iso8601 }}
           ============================================================
-          {% if all_rp_lines | length == 0 %}
+          {% if restore_points | default([]) | length == 0 %}
 
           No hay restore points activos en este servidor/CDB.
 
           {% else %}
-          {% for line in all_rp_lines %}
-          {% set f = line.split('|') %}
+          {% for rp in restore_points | default([]) %}
 
-          Máquina : {{ f[1] }}
-          BD(CDB) : {{ f[2] }}
-          PDB     : {{ f[3] }}
-          Nombre  : {{ f[4] }}
-          Fecha   : {{ f[5] }}
+          Máquina : {{ rp.maquina }}
+          BD(CDB) : {{ rp.bd }}
+          PDB     : {{ rp.pdb }}
+          Nombre  : {{ rp.nombre }}
+          Fecha   : {{ rp.fecha }}
           ------------------------------------------------------------
           {% endfor %}
           {% endif %}
@@ -278,6 +272,7 @@
           {% else %}
           >>> Hay {{ ns.total }} base(s) de datos con restore points activos <
           ============================================================
+
           {% for bloque in ns.bloques %}
           {{ bloque }}
           {% endfor %}
