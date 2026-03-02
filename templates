@@ -1,0 +1,131 @@
+---
+# check_tablespaces_multitenant.yml
+- name: Tablespaces UNDO y TEMP <= 2GB - Instancias MULTITENANT
+  hosts: oracle_multitenant
+  become: yes
+  become_user: oracle
+  serial: 1
+
+  tasks:
+
+    - name: Crear directorio de salida en servidor destino
+      file:
+        path: /tmp/ansible/salida
+        state: directory
+        mode: '0755'
+
+    - name: Enviar script de chequeo CDB ROOT
+      template:
+        src: templates/check_tablespaces_root.j2
+        dest: /tmp/ansible/check_tablespaces_root_{{ oracle_sid }}.sh
+        mode: '0755'
+
+    - name: Enviar script de chequeo PDBs
+      template:
+        src: templates/check_tablespaces_pdbs.j2
+        dest: /tmp/ansible/check_tablespaces_pdbs_{{ oracle_sid }}.sh
+        mode: '0755'
+
+    - name: Enviar script de pie de reporte
+      template:
+        src: templates/check_pie_reporte.j2
+        dest: /tmp/ansible/check_pie_reporte_{{ inventory_hostname }}.sh
+        mode: '0755'
+
+    - name: Ejecutar script CDB ROOT
+      shell:
+        cmd: /tmp/ansible/check_tablespaces_root_{{ oracle_sid }}.sh
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Ejecutar script PDBs
+      shell:
+        cmd: /tmp/ansible/check_tablespaces_pdbs_{{ oracle_sid }}.sh
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Ejecutar script pie de reporte
+      shell:
+        cmd: /tmp/ansible/check_pie_reporte_{{ inventory_hostname }}.sh
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Copiar reporte a maquina de control
+      fetch:
+        src: "/tmp/ansible/salida/report_tablespaces_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+        dest: "/software_oracle/DESARROLLOS_INTERNOS_SCRIPTS/ansible_CONSULTAS_EXACC/CHEQUEO_TEMP_UNDO/salida/report_tablespaces_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+        flat: yes
+
+    - name: Limpiar scripts temporales
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "/tmp/ansible/check_tablespaces_root_{{ oracle_sid }}.sh"
+        - "/tmp/ansible/check_tablespaces_pdbs_{{ oracle_sid }}.sh"
+        - "/tmp/ansible/check_pie_reporte_{{ inventory_hostname }}.sh"
+
+    - name: Mostrar ubicación del reporte
+      debug:
+        msg: "Reporte guardado en: /software_oracle/DESARROLLOS_INTERNOS_SCRIPTS/ansible_CONSULTAS_EXACC/CHEQUEO_TEMP_UNDO/salida/report_tablespaces_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+================================================>
+#!/bin/bash
+source /home/oracle/{{ cdb }}.env
+export ORACLE_SID={{ oracle_sid }}
+export PATH=$PATH:$ORACLE_HOME/bin
+
+HOSTNAME_INV="{{ inventory_hostname }}"
+REPORT=/tmp/ansible/salida/report_tablespaces_${HOSTNAME_INV}_$(date +%Y-%m-%d).txt
+
+if [ ! -f $REPORT ]; then
+  echo "============================================================" > $REPORT
+  echo "REPORTE TABLESPACES UNDO/TEMP <= 2GB - MULTITENANT"          >> $REPORT
+  echo "Fecha:  $(date +%Y-%m-%d) $(date +%H:%M:%S)"                >> $REPORT
+  echo "Host:   ${HOSTNAME_INV}"                                     >> $REPORT
+  echo "============================================================" >> $REPORT
+fi
+
+RESULTADO=$(sqlplus -s / as sysdba << EOF
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON
+SELECT
+    '$ORACLE_SID' || '|CDB\$ROOT|' ||
+    ts.tablespace_name || '|' ||
+    ts.contents || '|' ||
+    ROUND(SUM(df.bytes) / 1024 / 1024 / 1024, 2) || ' GB'
+FROM
+    dba_tablespaces ts
+    JOIN dba_data_files df ON ts.tablespace_name = df.tablespace_name
+WHERE
+    ts.contents = 'UNDO'
+GROUP BY
+    ts.tablespace_name, ts.contents
+HAVING
+    SUM(df.bytes) <= 2 * 1024 * 1024 * 1024
+UNION ALL
+SELECT
+    '$ORACLE_SID' || '|CDB\$ROOT|' ||
+    tf.tablespace_name || '|' ||
+    'TEMPORARY' || '|' ||
+    ROUND(SUM(tf.bytes) / 1024 / 1024 / 1024, 2) || ' GB'
+FROM
+    dba_temp_files tf
+GROUP BY
+    tf.tablespace_name
+HAVING
+    SUM(tf.bytes) <= 2 * 1024 * 1024 * 1024
+ORDER BY 1;
+EXIT;
+EOF
+)
+
+RESULTADO=$(echo "$RESULTADO" | grep -v '^$' | grep '|')
+if [ -n "$RESULTADO" ]; then
+  echo ""                                                           >> $REPORT
+  echo "--- CDB: $ORACLE_SID | Contenedor: CDB\$ROOT ---"         >> $REPORT
+  echo "SID | CONTENEDOR | TABLESPACE | TIPO | TAMAÑO"             >> $REPORT
+  echo "------------------------------------------------------------" >> $REPORT
+  echo "$RESULTADO"                                                 >> $REPORT
+fi
